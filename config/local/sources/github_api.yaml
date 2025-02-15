@@ -1,0 +1,78 @@
+pipeline_id: github_api
+description: "Ingests repository and issue data from GitHub API (Local Development)"
+enabled: true
+extractor_class: "api_pipeline.extractors.github.GitHubExtractor"
+
+api_config:
+  base_url: "https://api.github.com"
+  endpoints:
+    repos: "/orgs/{org}/repos"
+    issues: "/repos/{owner}/{repo}/issues"
+  auth_type: "bearer"
+  auth_credentials:
+    token: "${LOCAL_GITHUB_TOKEN}"  # Will be loaded from .env file
+  rate_limit: 30  # Lower rate limit for local testing
+  retry_count: 2
+  batch_size: 5
+  max_concurrent_requests: 3
+  session_timeout: 10
+  pagination:
+    enabled: true
+    strategy: page_number
+    page_size: 10
+    max_pages: 2
+    page_param: "page"
+    size_param: "per_page"
+
+parameters:
+  - name: "org"
+    type: "string"
+    required: true
+    description: "GitHub organization name"
+    default: "apache"  # Default for testing
+  - name: "repo_filter"
+    type: "string"
+    required: false
+    description: "Regex pattern to filter repositories"
+  - name: "since_date"
+    type: "string"
+    required: false
+    description: "Only fetch issues updated after this date (YYYY-MM-DD)"
+
+output:
+  - type: "bigquery"
+    enabled: false  # Disabled for local development
+    config:
+      project_id: "local-dev"
+      dataset_id: "raw_data_local"
+      table_id: "github_repo_issues"
+      schema:
+        - name: "repo_id"
+          type: "INTEGER"
+        - name: "repo_name"
+          type: "STRING"
+        - name: "repo_stars"
+          type: "INTEGER"
+        - name: "repo_forks"
+          type: "INTEGER"
+        - name: "issue_id"
+          type: "INTEGER"
+        - name: "issue_number"
+          type: "INTEGER"
+        - name: "issue_title"
+          type: "STRING"
+        - name: "issue_state"
+          type: "STRING"
+        - name: "issue_created_at"
+          type: "TIMESTAMP"
+        - name: "issue_updated_at"
+          type: "TIMESTAMP"
+        - name: "issue_closed_at"
+          type: "TIMESTAMP"
+
+  - type: "local_json"  # New output type for local development
+    enabled: true
+    config:
+      output_dir: "./data/github"
+      file_format: "jsonl"
+      partition_by: ["date", "org"] 

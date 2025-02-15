@@ -1,0 +1,55 @@
+pipeline_id: weather_api
+description: "Ingests weather data from OpenWeatherMap API (Production)"
+enabled: true
+extractor_class: "api_pipeline.extractors.weather.WeatherExtractor"
+
+api_config:
+  base_url: "https://api.openweathermap.org/data/2.5"  # Production endpoint
+  endpoints:
+    current: "/weather"
+    forecast: "/forecast"
+  auth_type: "api_key"
+  auth_credentials:
+    api_key: "${WEATHER_API_KEY_PROD}"  # Production credentials
+  rate_limit: 60  # Higher rate limit for production
+  retry_count: 5
+
+parameters:
+  - name: "location_ids"
+    type: "list"
+    required: false
+    description: "List of location IDs to fetch weather data for"
+  - name: "date_range"
+    type: "string"
+    required: false
+    description: "Date range for historical data in format YYYY-MM-DD/YYYY-MM-DD"
+
+output:
+  - type: "bigquery"
+    enabled: true
+    config:
+      project_id: "${GCP_PROJECT_ID_PROD}"
+      dataset_id: "raw_data"
+      table_id: "weather_data"
+      schema:
+        - name: "timestamp"
+          type: "TIMESTAMP"
+        - name: "location_id"
+          type: "STRING"
+        - name: "temperature"
+          type: "FLOAT"
+        - name: "humidity"
+          type: "INTEGER"
+        - name: "wind_speed"
+          type: "FLOAT"
+        - name: "conditions"
+          type: "STRING"
+      create_if_needed: true
+  
+  - type: "gcs"
+    enabled: false  # Disabled in production (using BigQuery only)
+    config:
+      bucket: "${GCS_BUCKET_PROD}"
+      prefix: "raw/weather"
+      file_format: "jsonl"
+      partition_by: "date" 

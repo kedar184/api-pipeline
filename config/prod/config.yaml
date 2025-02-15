@@ -1,0 +1,33 @@
+service:
+  name: api-pipeline
+  version: 1.0.0
+  log_level: INFO
+
+firestore:
+  collection_prefix: prod_
+  ttl_days: 90
+
+cache:
+  config_ttl_seconds: 600
+  max_size: 1000
+
+monitoring:
+  trace_sampling_ratio: 0.1
+  metrics_export_interval_seconds: 30
+
+retry:
+  max_attempts: 5
+  initial_delay_seconds: 2
+  max_delay_seconds: 30
+  multiplier: 2
+
+rate_limits:
+  default_rps: 500
+  max_concurrent: 200
+
+security:
+  require_authentication: true
+  allowed_domains:
+    - "google.com"
+    - "cloud.google.com"
+  vpc_access_only: true 

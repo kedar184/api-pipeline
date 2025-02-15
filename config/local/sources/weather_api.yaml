@@ -1,0 +1,60 @@
+pipeline_id: weather_api
+description: "Ingests weather data from OpenWeatherMap API (Local Development)"
+enabled: true
+extractor_class: "api_pipeline.extractors.weather.WeatherExtractor"
+
+api_config:
+  base_url: "https://api.openweathermap.org/data/2.5"
+  endpoints:
+    current: "/weather"
+    forecast: "/forecast"
+  auth_type: "api_key"
+  auth_credentials:
+    api_key: "${LOCAL_WEATHER_API_KEY}"  # Will be loaded from .env file
+  rate_limit: 10  # Lower rate limit for local testing
+  retry_count: 2
+  batch_size: 10
+  max_concurrent_requests: 5
+  session_timeout: 10
+  pagination:
+    enabled: true
+    page_size: 10
+    max_pages: 2
+
+parameters:
+  - name: "location_ids"
+    type: "list"
+    required: false
+    description: "List of location IDs to fetch weather data for"
+  - name: "date_range"
+    type: "string"
+    required: false
+    description: "Date range for historical data in format YYYY-MM-DD/YYYY-MM-DD"
+
+output:
+  - type: "bigquery"
+    enabled: false  # Disabled for local development
+    config:
+      project_id: "local-dev"
+      dataset_id: "raw_data_local"
+      table_id: "weather_data"
+      schema:
+        - name: "timestamp"
+          type: "TIMESTAMP"
+        - name: "location_id"
+          type: "STRING"
+        - name: "temperature"
+          type: "FLOAT"
+        - name: "humidity"
+          type: "INTEGER"
+        - name: "wind_speed"
+          type: "FLOAT"
+        - name: "conditions"
+          type: "STRING"
+  
+  - type: "local_json"  # New output type for local development
+    enabled: true
+    config:
+      output_dir: "./data/weather"
+      file_format: "jsonl"
+      partition_by: "date" 

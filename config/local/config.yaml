@@ -1,0 +1,33 @@
+service:
+  name: api-pipeline-local
+  version: 1.0.0
+  log_level: DEBUG
+
+firestore:
+  collection_prefix: local_
+  ttl_days: 7
+
+cache:
+  config_ttl_seconds: 60
+  max_size: 50
+
+monitoring:
+  trace_sampling_ratio: 1.0
+  metrics_export_interval_seconds: 30
+
+retry:
+  max_attempts: 2
+  initial_delay_seconds: 1
+  max_delay_seconds: 5
+  multiplier: 2
+
+rate_limits:
+  default_rps: 50
+  max_concurrent: 10
+
+secrets:
+  # Local secrets for development - DO NOT USE IN PRODUCTION
+  weather_api_key: "your-openweathermap-api-key"
+  github_token: "your-github-personal-access-token"
+  gcp_project_id: "local-dev-project"
+  gcs_bucket: "local-dev-bucket" 

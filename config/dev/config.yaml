@@ -1,0 +1,26 @@
+service:
+  name: api-pipeline-dev
+  version: 1.0.0
+  log_level: DEBUG
+
+firestore:
+  collection_prefix: dev_
+  ttl_days: 30
+
+cache:
+  config_ttl_seconds: 300
+  max_size: 100
+
+monitoring:
+  trace_sampling_ratio: 1.0
+  metrics_export_interval_seconds: 60
+
+retry:
+  max_attempts: 3
+  initial_delay_seconds: 1
+  max_delay_seconds: 10
+  multiplier: 2
+
+rate_limits:
+  default_rps: 100
+  max_concurrent: 50 

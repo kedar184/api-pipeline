@@ -1,0 +1,134 @@
+i have a new folder called api-pipeline. this is a new project. 
+the goal of the project is to ingest data into bigquery from various api sources and build it as a framework that can handle multiple use cases.
+it is a framework for data ingestion into bigquery which is the data platform.
+Build the framework in python. use fastapi if required
+
+chaining is a common scenario with API's considering a data pipeline where we may need to loop through multiple endpoints to get a full dataset. 
+can u search through a public api example so that we can implement that as a reference
+
+Lets add to our codebase and attempt to implement the following:
+Implement pagination support for handling large datasets
+Add parallel processing for the chained requests
+Add error handling and retry logic
+
+lets switch context back to api-pipeline project. 
+go through the codebase and explain me what is done so far and we will start progressing
+
+our yaml is going to grow big and will be a issue for managing changes. i think we should have a yaml definition per source. 
+Also, i expect this to be deployed in cloud run and can u provide a endpoint for triggering a specific pipeline ? 
+i expect to use airflow or cloud workflows as a scheduling took that will trigger this. I also want GCS as a optional target. 
+So, in summary:
+A schduler (airflow/cloud workflow) will invoke a rest endpoint specifying the pipeline and any optional parameters that the pipeline needs (think of query params as an example). 
+The params can be simple key value pairs. The endpoint then uses the specific yaml config to derive all params and invokes a concrete implementation (extractor) that is inturn using a common abstract class such as baseextractor. 
+Can you propose changes for me to review ?
+
+Create concrete handlers for GCS and Bigquery outputs. 
+I would think of it in a simillar fashion to terraform modules
+
+For GCS, can we add specific support for CSV, AVRO and Parquet formats ?
+
+how about json format it will not be possible to specify schema in this way
+Think about JSON Schema keywords while imlplementing this
+Think about references and reusable definitions
+
+lets cleanup the codebase a bit before adding more features.. Consider the following:
+We are not using scheduling functionality in our pipeline. that sits outside of our ingestion pipeline.
+We need to store state outside of our implementation since this is serverless, stateless and multiple instance - potentially using bigquery/firestore/cloudsql for state management.
+Think if we still need fastapi ? we still need a endpoint for job triggers that can return a job id but job monitoring will sit outside of this.
+
+I like the choice of firestore. explain your thought process and considerations.
+Also, explain the choice of cloud functions. I would have preferred container being deployed on cloud run considering few other aspects
+
+lets add a cloudbuild config simillar to our starter project. We will add some observability features later
+
+lets create environment specific config
+
+can u look at main.py and the endpoint configuration. refactor according to our requirements as discussed previously
+
+How do u plan to implement this since we have no shared state unless we are retrieving from firestore.. can u explain the implementation code
+
+lets go with option 2 above and refactor all code
+
+factory, function and service class files still exist in main folder can u delete it
+
+Update any import statements in other files to reflect these name changes
+Add an __init__.py to expose the output classes cleanly
+
+put some documentation on files base and models explaining what it does based on above explainations that can help developers maintain the codebase
+can u create a class diagram as well. 
+also do we need a seperate output folder for structuring. everything else seems to be in core folder. i suggest either we seperate out extractor from core or we keep all in core what do u think ?
+
+delete pipelines.yaml given we have seperate files in sources folder. Also, we should probably have sources as part of environment as parameters such as API url can change
+
+why do we need this here.. pipeline manager should be agnostic of underlying implementation
+
+bigquery_config why is this part of pipeline config. its tight coupling
+
+we dont have schedules anymore. i spotted this but remove anything related to schedules from the codebase
+
+factory.py has load_pipeline_config method 
+why does it use gcs to store config ? explain the reason and implementation of this method. change as needed
+
+given the code runs on serverless, does the program load all pipelines when it recieves a HTTP request ?
+
+are these class definitions needed in main.py now that we have moded the definitions to models.py
+
+lets focus on secrets. i want secrets to be handled by secret manager. hava a naming convention like api_pipeline/
+
+lets remove secret lifecycle related code. assume thats done using iac. we are only fetching secret from path. for simplicity lets have secret path in yaml for api config instead of it being derived
+
+Looking at the codebase, I can see that pagination is not properly handled. Let's look at the GitHub extractor as an example
+
+now lets think of performance and handling large volumes. think of making it core functionality as opposed to implementation specific
+
+have a local config folder. copy from dev and handle secrets since we are not connected to gcp and cant access secret manager for local testing
+
+lets focus a bit on test classes. can u create a test classes for all codebase and maximize coverage
+
+Lets focus on auth. Lets seperate out outh in a separate file and create a base class.
+Lets also add support for oauth refresh token flow
+
+relook at github extractor class and see if the methods like ensure_session is still needed with our auth implementation
+do same changes for weather extractor
+
+lets add retry mechanism with backoff to our implementation
+
+should our base.py be renamed to base_extractor.py ? what do u think based on the code context now which naming convention is better
+
+lets add a feature. it's a common scenario in data pipelines that we would be working on watermark based pull approach. 
+Can u think of implemeniont for that where its config driven if feasible. Think of batching using fix windows
+
+where is last watermark field stored in this implementation
+How are we passing the high low watermarks in api request 
+Can you write a extractor sample by picking an appropriate public API
+
+changes not reflected in local config. can u please reapply
+
+add the .env to gitignore since it contains secrets
+
+what about setup.py is that still required can we move to pyproject.toml?
+
+what minimum permissions should i provide the token so we can execute the 2 sample scenarios
+
+looks like we are struck with a error related to authconfig. lets try black box tesing against config and then work on the test class
+
+see the time it took and is that something that we can optimize ? 
+
+thats good for now. lets bake in some of these metrics as part of our core framework so in future its easy to track performance and tweak things accordingly.
+
+we had a working version of test_github_commits.py can we run that
+
+i have deleted test_github_commits_new to avoid confusion since it was a duplicate. Lets focus on lets test_github_commits 
+lets run one more time since we have changed the dictionary value from duration_seconds to uptime
+trace each print statement and the name of the metric used in lookup to the base.py file where the metric is located
+
+this is what i see in base.py shouldnt we just be using this without worrying about how its calculated since it has a base value ? 
+if we see anomolies, we will get to the calculations
+
+****** some doco prompts
+write a document on the system design and place it in docs folder
+In system design, can u clearly explain the class diagram for all files in core and how they interact with each other to help the framework being extensible
+looks good. now read the system design document and tell me what is missing in our implementation
+make sure there is a md for each file in core and optimize doco if possible
+update readme based on recent chanes. point to doc folder and also mention github and weather are used as examples
+move all cloudbuild files to a .cloud/ci directory does that naming convention sound right ? if all good add this to readme section as well. and for now remove license/contribution sections from the readme

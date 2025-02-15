@@ -1,0 +1,94 @@
+pipeline_id: github_commits
+description: "Ingests repository commits from GitHub API with watermark-based incremental loading"
+enabled: true
+extractor_class: "api_pipeline.extractors.github_commits.GitHubCommitsExtractor"
+
+api_config:
+  base_url: "https://api.github.com"
+  endpoints:
+    commits: "/repos/{owner}/{repo}/commits"
+  auth_type: "bearer"
+  auth_credentials:
+    token: "${GITHUB_TOKEN_DEV}"  # Development credentials
+  rate_limit: 1000  # GitHub API rate limit
+  retry_count: 3
+  batch_size: 50
+  max_concurrent_requests: 5
+  session_timeout: 30
+  
+  # Watermark configuration
+  watermark:
+    enabled: true
+    timestamp_field: "committed_at"
+    watermark_field: "last_commit_watermark"
+    window:
+      window_type: "fixed"
+      window_size: "1h"      # Process in 1-hour windows
+      window_offset: "0m"
+      timestamp_field: "committed_at"
+    lookback_window: "7d"    # Look back 7 days on first run
+  
+  # Pagination configuration
+  pagination:
+    enabled: true
+    strategy: "page_number"
+    page_size: 100          # GitHub's max page size
+    max_pages: 10           # Limit for development
+    page_param: "page"
+    size_param: "per_page"
+
+parameters:
+  - name: "repo"
+    type: "string"
+    required: true
+    description: "GitHub repository in format owner/repo"
+    default: "apache/spark"
+  - name: "branch"
+    type: "string"
+    required: false
+    description: "Branch to fetch commits from"
+  - name: "author"
+    type: "string"
+    required: false
+    description: "Filter commits by author"
+
+output:
+  - type: "bigquery"
+    enabled: true
+    config:
+      project_id: "${GCP_PROJECT_ID_DEV}"
+      dataset_id: "raw_data_dev"
+      table_id: "github_commits"
+      schema:
+        - name: "commit_id"
+          type: "STRING"
+        - name: "repo_name"
+          type: "STRING"
+        - name: "author_name"
+          type: "STRING"
+        - name: "author_email"
+          type: "STRING"
+        - name: "message"
+          type: "STRING"
+        - name: "commit_url"
+          type: "STRING"
+        - name: "committed_at"
+          type: "TIMESTAMP"
+        - name: "files_changed"
+          type: "INTEGER"
+        - name: "additions"
+          type: "INTEGER"
+        - name: "deletions"
+          type: "INTEGER"
+        - name: "processed_at"
+          type: "TIMESTAMP"
+      create_if_needed: true
+      partition_by: "committed_at"
+      cluster_by: ["repo_name", "author_name"]
+
+  - type: "local_json"  # For development/testing
+    enabled: true
+    config:
+      output_dir: "./data/github/commits"
+      file_format: "jsonl"
+      partition_by: ["date", "repo"] 

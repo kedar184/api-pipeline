@@ -1,0 +1,102 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "api_pipeline"
+version = "0.1.0"
+description = "API Pipeline Framework for building data pipelines with watermark-based incremental loading"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "Your Name", email = "your.email@example.com" }
+]
+keywords = ["api", "pipeline", "etl", "data", "watermark"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "fastapi>=0.68.0",
+    "uvicorn>=0.15.0",
+    "pydantic>=1.8.0",
+    "google-cloud-storage>=2.0.0",
+    "google-cloud-bigquery>=3.0.0",
+    "google-cloud-firestore>=2.0.0",
+    "google-cloud-secret-manager>=2.17.0",
+    "functions-framework>=3.0.0",
+    "loguru>=0.6.0",
+    "pandas>=1.3.0",
+    "pyarrow>=7.0.0",
+    "fastavro>=1.4.0",
+    "python-snappy>=0.6.0",
+    "pyyaml>=6.0.0",
+    "aiohttp>=3.8.0",
+    "requests>=2.31.0",
+    "python-dotenv>=1.0.1",
+    "python-multipart>=0.0.9",
+    "backoff>=2.0.0",
+    "python-dateutil>=2.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.18.0",
+    "pytest-cov>=3.0.0",
+    "pytest-mock>=3.7.0",
+    "black>=22.0.0",
+    "isort>=5.10.0",
+    "flake8>=4.0.0",
+    "mypy>=0.950",
+    "types-PyYAML>=6.0.0",
+    "types-python-dateutil>=2.8.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["api_pipeline"]
+
+[tool.black]
+line-length = 88
+target-version = ["py38"]
+include = '\.pyi?$'
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 88
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "--verbose",
+    "--cov=api_pipeline",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+    "--cov-branch",
+    "--asyncio-mode=auto",
+]
+env = ["PYTHONPATH=src"]
+
+[project.urls]
+"Homepage" = "https://github.com/yourusername/api-pipeline"
+"Bug Tracker" = "https://github.com/yourusername/api-pipeline/issues"
+"Documentation" = "https://github.com/yourusername/api-pipeline/docs" 

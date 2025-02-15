@@ -1,0 +1,69 @@
+pipeline_id: github_api
+description: "Ingests repository and issue data from GitHub API (Production)"
+enabled: true
+extractor_class: "api_pipeline.extractors.github.GitHubExtractor"
+
+api_config:
+  base_url: "https://api.github.com"
+  endpoints:
+    repos: "/orgs/{org}/repos"
+    issues: "/repos/{owner}/{repo}/issues"
+  auth_type: "bearer"
+  auth_credentials:
+    token: "${GITHUB_TOKEN_PROD}"  # Production credentials
+  rate_limit: 5000  # Higher rate limit for production
+  retry_count: 5
+
+parameters:
+  - name: "org"
+    type: "string"
+    required: true
+    description: "GitHub organization name"
+  - name: "repo_filter"
+    type: "string"
+    required: false
+    description: "Regex pattern to filter repositories"
+  - name: "since_date"
+    type: "string"
+    required: false
+    description: "Only fetch issues updated after this date (YYYY-MM-DD)"
+
+output:
+  - type: "bigquery"
+    enabled: true
+    config:
+      project_id: "${GCP_PROJECT_ID_PROD}"
+      dataset_id: "raw_data"
+      table_id: "github_repo_issues"
+      schema:
+        - name: "repo_id"
+          type: "INTEGER"
+        - name: "repo_name"
+          type: "STRING"
+        - name: "repo_stars"
+          type: "INTEGER"
+        - name: "repo_forks"
+          type: "INTEGER"
+        - name: "issue_id"
+          type: "INTEGER"
+        - name: "issue_number"
+          type: "INTEGER"
+        - name: "issue_title"
+          type: "STRING"
+        - name: "issue_state"
+          type: "STRING"
+        - name: "issue_created_at"
+          type: "TIMESTAMP"
+        - name: "issue_updated_at"
+          type: "TIMESTAMP"
+        - name: "issue_closed_at"
+          type: "TIMESTAMP"
+      create_if_needed: true
+
+  - type: "gcs"
+    enabled: false  # Disabled in production (using BigQuery only)
+    config:
+      bucket: "${GCS_BUCKET_PROD}"
+      prefix: "raw/github"
+      file_format: "jsonl"
+      partition_by: ["date", "org"] 
