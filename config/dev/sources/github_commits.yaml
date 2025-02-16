@@ -27,6 +27,9 @@ api_config:
       window_offset: "0m"
       timestamp_field: "committed_at"
     lookback_window: "7d"    # Look back 7 days on first run
+    start_time_param: "since"  # GitHub-specific parameter name
+    end_time_param: "until"    # GitHub-specific parameter name
+    time_format: "%Y-%m-%dT%H:%M:%SZ"  # GitHub's expected time format
   
   # Pagination configuration
   pagination:

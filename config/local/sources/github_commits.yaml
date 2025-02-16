@@ -26,7 +26,10 @@ api_config:
       window_size: "24h"     # Increased window size for fewer API calls
       window_offset: "0m"
       timestamp_field: "committed_at"
-    lookback_window: "1d"    # Shorter lookback for local testing
+    lookback_window: "1d"    # Reduced to 1 day for faster local testing
+    start_time_param: "since"  # GitHub-specific parameter name
+    end_time_param: "until"    # GitHub-specific parameter name
+    time_format: "%Y-%m-%dT%H:%M:%SZ"  # GitHub's expected time format
   
   # Pagination configuration
   pagination:

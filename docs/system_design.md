@@ -452,3 +452,153 @@ output:
    - Independent batch error handling
    - Partial success capability
    - Clear error tracking per batch 
+
+## Parallel Processing and Window Management
+
+### Window-Based Processing Architecture
+
+```mermaid
+graph TD
+    A[Time Range] --> B[Window Manager]
+    B --> C1[Window 1]
+    B --> C2[Window 2]
+    B --> C3[Window 3]
+    C1 --> D[Parallel Processor]
+    C2 --> D
+    C3 --> D
+    D --> E1[Batch 1]
+    D --> E2[Batch 2]
+    D --> E3[Batch 3]
+    E1 --> F[Output Manager]
+    E2 --> F
+    E3 --> F
+```
+
+### Window Processing Strategy
+
+1. **Time Window Division**
+   - Large time ranges split into fixed windows
+   - Default window size: 24 hours
+   - Configurable via `window_size` parameter
+   ```python
+   window_config = WindowConfig(
+       window_type=WindowType.FIXED,
+       window_size="24h",
+       window_offset="0m"
+   )
+   ```
+
+2. **Parallel Window Processing**
+   - Concurrent processing of multiple windows
+   - Controlled by `max_concurrent_requests`
+   - Semaphore-based concurrency control
+   ```python
+   async def _process_windows(self, windows):
+       semaphore = asyncio.Semaphore(self.config.max_concurrent_requests)
+       async with semaphore:
+           return await asyncio.gather(*[self._process_window(w) for w in windows])
+   ```
+
+3. **Window-Level Watermarking**
+   - Track progress per window
+   - Prevent duplicate processing
+   - Enable incremental updates
+   ```python
+   async def _update_window_watermark(self, window_end):
+       self._watermark_store[self._get_watermark_key()] = window_end
+   ```
+
+### Enhanced Batch Processing
+
+1. **Multi-Level Batching**
+   - API-level batching (configurable size)
+   - Window-level batching (time-based)
+   - Output-level batching (storage optimization)
+
+2. **Batch Size Optimization**
+   ```python
+   # Extractor level
+   batch_size = min(
+       self.config.batch_size,
+       self.config.rate_limit // self.config.max_concurrent_requests
+   )
+   
+   # Output level
+   output_batch_size = min(
+       self.config.output_batch_size,
+       available_memory // estimated_record_size
+   )
+   ```
+
+3. **Memory Management**
+   - Controlled batch loading
+   - Immediate batch processing
+   - Efficient resource cleanup
+   ```python
+   async def _process_batch(self, batch):
+       try:
+           result = await self._transform_batch(batch)
+           await self._write_batch(result)
+       finally:
+           # Clean up batch resources
+           del batch
+   ```
+
+### Performance Monitoring
+
+1. **Window Metrics**
+   ```python
+   window_metrics = {
+       'window_start': window.start_time,
+       'window_end': window.end_time,
+       'processing_time': processing_duration,
+       'records_processed': record_count,
+       'batch_count': batch_count
+   }
+   ```
+
+2. **Batch Performance**
+   ```python
+   batch_metrics = {
+       'batch_size': len(batch),
+       'processing_time': batch_duration,
+       'memory_usage': current_memory,
+       'success_rate': successful_records / total_records
+   }
+   ```
+
+3. **Resource Utilization**
+   - Memory usage per batch
+   - Processing time per window
+   - Concurrent operations count
+   - I/O operations monitoring
+
+### Error Handling and Recovery
+
+1. **Window-Level Recovery**
+   ```python
+   async def _process_window_with_retry(self, window):
+       for attempt in range(max_retries):
+           try:
+               return await self._process_window(window)
+           except Exception as e:
+               if attempt == max_retries - 1:
+                   raise
+               await asyncio.sleep(retry_delay)
+   ```
+
+2. **Batch-Level Error Handling**
+   ```python
+   async def _process_batch_safe(self, batch):
+       try:
+           return await self._process_batch(batch)
+       except Exception as e:
+           logger.error(f"Batch processing failed: {str(e)}")
+           self._metrics['failed_batches'] += 1
+           return []
+   ```
+
+3. **Partial Success Handling**
+   - Track failed records
+   - Continue processing valid records
+   - Report detailed error metrics 

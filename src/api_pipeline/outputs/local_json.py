@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 from datetime import datetime, UTC
 from typing import Any, Dict, List
 from pathlib import Path
@@ -15,14 +16,16 @@ class DateTimeEncoder(json.JSONEncoder):
         return super().default(obj)
 
 class LocalJsonOutput(BaseOutput):
-    """Handler for writing data to local JSON files."""
+    """Handler for writing data to local JSON files with parallel batch processing."""
 
     def __init__(self, config: OutputConfig):
         super().__init__(config)
         self.output_dir = Path(self.config.config["output_dir"])
         self.file_format = self.config.config.get("file_format", "jsonl")
         self.partition_by = self.config.config.get("partition_by", None)
-        self.current_file = None
+        self.batch_size = self.config.config.get("batch_size", 1000)  # Default batch size
+        self.max_concurrent_writes = self.config.config.get("max_concurrent_writes", 5)  # Limit concurrent writes
+        self._semaphore = asyncio.Semaphore(self.max_concurrent_writes)
         self._ensure_output_dir()
 
     async def initialize(self) -> None:
@@ -62,30 +65,64 @@ class LocalJsonOutput(BaseOutput):
         
         return self.output_dir / filename
 
+    async def _write_batch(self, batch: List[Dict[str, Any]], partition_path: str) -> None:
+        """Write a batch of records to a file."""
+        if not batch:
+            return
+
+        try:
+            async with self._semaphore:  # Limit concurrent writes
+                # Get output file path
+                output_file = self._get_output_file(partition_path)
+                
+                # Write data based on format
+                if self.file_format == "jsonl":
+                    with open(output_file, "w") as f:
+                        for record in batch:
+                            f.write(json.dumps(record, cls=DateTimeEncoder) + "\n")
+                else:  # regular json
+                    with open(output_file, "w") as f:
+                        json.dump(batch, f, indent=2, cls=DateTimeEncoder)
+                
+                logger.info(f"Successfully wrote batch of {len(batch)} records to {output_file}")
+                
+        except Exception as e:
+            logger.error(f"Error writing batch to local JSON file: {str(e)}")
+            raise
+
     async def write(self, data: List[Dict[str, Any]]) -> None:
-        """Write data to a local JSON file."""
+        """Write data to local JSON files in parallel batches."""
         if not data:
             logger.warning("No data to write")
             return
 
         try:
-            # Get partition path from first record
-            partition_path = self._get_partition_path(data[0])
-            output_file = self._get_output_file(partition_path)
+            # Group data by partition path
+            partitioned_data: Dict[str, List[Dict[str, Any]]] = {}
+            for record in data:
+                partition_path = self._get_partition_path(record)
+                if partition_path not in partitioned_data:
+                    partitioned_data[partition_path] = []
+                partitioned_data[partition_path].append(record)
+
+            # Process each partition's data in batches
+            write_tasks = []
+            for partition_path, partition_data in partitioned_data.items():
+                # Split partition data into batches
+                for i in range(0, len(partition_data), self.batch_size):
+                    batch = partition_data[i:i + self.batch_size]
+                    write_tasks.append(self._write_batch(batch, partition_path))
+
+            # Write batches in parallel
+            await asyncio.gather(*write_tasks)
             
-            # Write data based on format
-            if self.file_format == "jsonl":
-                with open(output_file, "w") as f:
-                    for record in data:
-                        f.write(json.dumps(record, cls=DateTimeEncoder) + "\n")
-            else:  # regular json
-                with open(output_file, "w") as f:
-                    json.dump(data, f, indent=2, cls=DateTimeEncoder)
-            
-            logger.info(f"Successfully wrote {len(data)} records to {output_file}")
+            # Update metrics
+            self._metrics['records_written'] += len(data)
+            self._metrics['last_write_time'] = datetime.now(UTC)
             
         except Exception as e:
             logger.error(f"Error writing to local JSON file: {str(e)}")
+            self._metrics['write_errors'] += 1
             raise
 
     async def close(self) -> None:

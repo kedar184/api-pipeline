@@ -117,6 +117,11 @@ class WatermarkConfig(BaseModel):
     initial_watermark: Optional[datetime] = None
     lookback_window: str = "0m"  # How far to look back from watermark
     
+    # Time range parameter names for API requests
+    start_time_param: str = "start_time"  # Parameter name for start time
+    end_time_param: str = "end_time"      # Parameter name for end time
+    time_format: str = "%Y-%m-%dT%H:%M:%SZ"  # Format for time parameters
+    
     @property
     def lookback_seconds(self) -> int:
         """Convert lookback window to seconds."""
@@ -230,15 +235,19 @@ class BaseExtractor(ABC):
         return metrics
 
     async def _ensure_session(self):
-        """Initialize session with authentication."""
+        """Initialize session with authentication and headers."""
         if not self.session:
-            timeout = aiohttp.ClientTimeout(total=self.config.session_timeout)
+            # Get auth headers from auth handler
+            self.auth_handler = create_auth_handler(self.config.auth_config)
             headers = await self.auth_handler.get_auth_headers()
-            self.session = aiohttp.ClientSession(
-                timeout=timeout,
-                headers=headers
-            )
-    
+            # Allow subclasses to add specific headers
+            headers.update(self._get_additional_headers())
+            self.session = aiohttp.ClientSession(headers=headers)
+
+    def _get_additional_headers(self) -> Dict[str, str]:
+        """Get additional headers for the API. Override in subclass if needed."""
+        return {}
+
     @abstractmethod
     async def _transform_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         """Transform a single item from the API response.
@@ -256,7 +265,7 @@ class BaseExtractor(ABC):
         pass
 
     @abstractmethod
-    def validate_parameters(self, parameters: Optional[Dict[str, Any]] = None) -> None:
+    def _validate(self, parameters: Optional[Dict[str, Any]] = None) -> None:
         """Validate extraction parameters.
         
         Args:
@@ -321,6 +330,9 @@ class BaseExtractor(ABC):
         page_count = 0
         next_token = None
 
+        logger.info(f"Starting paginated request with strategy: {pagination.strategy}")
+        logger.info(f"Initial parameters: {page_params}")
+
         while True:
             # Update parameters based on pagination strategy
             if pagination.strategy == PaginationType.PAGE_NUMBER:
@@ -339,26 +351,32 @@ class BaseExtractor(ABC):
                 page_params[pagination.token_param] = next_token
 
             try:
+                logger.info(f"Making request for page {page_count + 1} with params: {page_params}")
                 async with self._semaphore:
                     response = await self._make_request(endpoint, page_params, endpoint_override)
                     
                 items = self._extract_items(response)
+                logger.info(f"Received {len(items)} items in page {page_count + 1}")
                 all_results.extend(items)
                 page_count += 1
 
                 # Get next token based on strategy
                 next_token = self._get_next_token(response, pagination)
+                logger.info(f"Next token: {next_token}")
                 
                 # Check if we should continue
-                if not self._should_continue_pagination(
+                should_continue = self._should_continue_pagination(
                     response, items, page_count, next_token, pagination
-                ):
+                )
+                logger.info(f"Should continue pagination: {should_continue}")
+                if not should_continue:
                     break
 
             except Exception as e:
                 logger.error(f"Pagination request failed: {str(e)}")
                 break
 
+        logger.info(f"Completed pagination with {page_count} pages and {len(all_results)} total items")
         return all_results
 
     def _extract_items(self, response: Any) -> List[Dict[str, Any]]:
@@ -418,20 +436,17 @@ class BaseExtractor(ABC):
         return False
 
     def _get_window_bounds(self, start_time: datetime) -> List[Tuple[datetime, datetime]]:
-        """Calculate window bounds for the extraction period.
-        
-        Args:
-            start_time: Start time for windowing
-            
-        Returns:
-            List of (window_start, window_end) tuples
-        """
+        """Calculate window bounds for the extraction period."""
         if not self.config.watermark or not self.config.watermark.window:
+            logger.warning("No window configuration, using single window")
             return [(start_time, datetime.now(UTC))]
             
         window_config = self.config.watermark.window
         window_size = window_config.window_size_seconds
         current_time = datetime.now(UTC)
+        
+        logger.info(f"Calculating windows from {start_time.isoformat()} to {current_time.isoformat()}")
+        logger.info(f"Window size: {window_size} seconds")
         
         windows = []
         window_start = start_time
@@ -444,18 +459,41 @@ class BaseExtractor(ABC):
             windows.append((window_start, window_end))
             window_start = window_end
             
+        logger.info(f"Generated {len(windows)} windows")
+        for i, (w_start, w_end) in enumerate(windows):
+            logger.info(f"Window {i+1}: {w_start.isoformat()} to {w_end.isoformat()}")
+            
         return windows
 
     async def _get_last_watermark(self) -> Optional[datetime]:
-        """Get the last watermark value. Override in subclass to implement storage."""
+        """Get the last watermark value from storage."""
+        if not hasattr(self, '_watermark_store'):
+            self._watermark_store = {}
+        
+        key = self._get_watermark_key()
+        stored_watermark = self._watermark_store.get(key)
+        
+        if stored_watermark:
+            return stored_watermark
+        
         if self.config.watermark and self.config.watermark.initial_watermark:
             return self.config.watermark.initial_watermark
-        return None
+            
+        # Default to configured lookback if no watermark
+        return datetime.now(UTC) - timedelta(
+            seconds=self.config.watermark.lookback_seconds
+        )
+
+    def _get_watermark_key(self) -> str:
+        """Get key for watermark storage. Override in subclass if needed."""
+        return "default"
 
     async def _update_watermark(self, new_watermark: datetime) -> None:
-        """Update the watermark value. Override in subclass to implement storage."""
-        self._current_watermark = new_watermark
+        """Update the watermark value in storage."""
+        key = self._get_watermark_key()
+        self._watermark_store[key] = new_watermark
         self._metrics['watermark_updates'] += 1
+        logger.info(f"Updated watermark for {key} to {new_watermark.isoformat()}")
 
     def _apply_watermark_filters(
         self,
@@ -465,15 +503,20 @@ class BaseExtractor(ABC):
     ) -> Dict[str, Any]:
         """Apply watermark-based filters to request parameters."""
         if not self.config.watermark or not self.config.watermark.enabled:
+            logger.warning("Watermark filtering is disabled")
             return params
             
-        timestamp_field = self.config.watermark.timestamp_field
         params = {**params} if params else {}
         
-        # Add timestamp range filters
-        params[f"{timestamp_field}_gte"] = window_start.isoformat()
-        params[f"{timestamp_field}_lt"] = window_end.isoformat()
+        # Use configured parameter names and time format
+        watermark = self.config.watermark
+        logger.info(f"Applying watermark filters with config: start_param={watermark.start_time_param}, end_param={watermark.end_time_param}")
+        logger.info(f"Window bounds: {window_start.isoformat()} to {window_end.isoformat()}")
         
+        params[watermark.start_time_param] = window_start.strftime(watermark.time_format)
+        params[watermark.end_time_param] = window_end.strftime(watermark.time_format)
+        
+        logger.info(f"Final parameters after watermark filters: {params}")
         return params
 
     async def extract(self, parameters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -674,6 +717,66 @@ class BaseExtractor(ABC):
         finally:
             if state['attempts'] >= self.config.retry.max_attempts:
                 self._retry_state.pop(request_id, None)
+
+    def _get_endpoint_override(self, parameters: Dict[str, Any]) -> Optional[str]:
+        """Get the endpoint override for the API request.
+        Override this in subclasses to provide custom endpoint construction.
+        
+        Args:
+            parameters: The parameters passed to the extractor
+            
+        Returns:
+            Optional endpoint override string
+        """
+        return None
+
+    async def _process_window(self, window_start: datetime, window_end: datetime, parameters: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Process a single time window and return items."""
+        window_start_time = time.time()
+        self._metrics['window_count'] += 1
+        logger.info(f"Starting window processing: {window_start} to {window_end}")
+        
+        # Apply watermark filters
+        window_params = self._apply_watermark_filters(
+            parameters, window_start, window_end
+        )
+        logger.info(f"Window parameters after watermark filters: {window_params}")
+        
+        # Get endpoint override if any
+        endpoint_override = self._get_endpoint_override(parameters)
+        logger.info(f"Using endpoint override: {endpoint_override}")
+        
+        # Fetch items for window using the first endpoint key
+        endpoint_key = next(iter(self.config.endpoints.keys()))
+        logger.info(f"Using endpoint key: {endpoint_key}")
+        
+        items = await self._paginated_request(
+            endpoint_key,
+            params=window_params,
+            endpoint_override=endpoint_override
+        )
+        
+        logger.info(f"Received {len(items) if items else 0} items from API")
+        
+        if not items:
+            window_end_time = time.time()
+            logger.info(f"Window processing completed in {window_end_time - window_start_time:.2f} seconds")
+            return []
+        
+        # Transform items in parallel
+        transformed_items = await asyncio.gather(
+            *[self._transform_item(item) for item in items]
+        )
+        
+        window_end_time = time.time()
+        processing_time = window_end_time - window_start_time
+        logger.info(f"Window processing completed in {processing_time:.2f} seconds")
+        logger.info(f"Transformed {len(transformed_items)} items")
+        if transformed_items:
+            first_item = transformed_items[0]
+            logger.info(f"Sample transformed item timestamp: {first_item.get(self.config.watermark.timestamp_field)}")
+        
+        return transformed_items
 
 
 class OutputConfig(BaseModel):

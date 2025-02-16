@@ -1,0 +1,48 @@
+pipeline_id: test_api
+description: "Test API extractor for implementation guide verification"
+enabled: true
+extractor_class: "tests.extractors.test_implementation_guide.TestApiExtractor"
+
+api_config:
+  base_url: "https://api.example.com/v2"
+  endpoints:
+    users: "/accounts/{account_id}/users"
+    orders: "/accounts/{account_id}/orders"
+  auth_type: "bearer"
+  auth_credentials:
+    token: "test-token"
+  
+  # Performance settings
+  rate_limit: 100
+  retry_count: 3
+  batch_size: 50
+  max_concurrent_requests: 10
+  
+  # Pagination settings
+  pagination:
+    enabled: true
+    strategy: "page_number"
+    page_size: 100
+    max_pages: 10
+    
+  # Watermark settings
+  watermark:
+    enabled: true
+    timestamp_field: "created_at"
+    window:
+      window_size: "1h"
+    lookback_window: "7d"
+
+parameters:
+  - name: "account_id"
+    type: "string"
+    required: true
+    description: "Account ID to fetch data for"
+
+output:
+  - type: "local_json"
+    enabled: true
+    config:
+      output_dir: "./data/test_api"
+      file_format: "jsonl"
+      partition_by: ["date"] 

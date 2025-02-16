@@ -31,6 +31,17 @@ how about json format it will not be possible to specify schema in this way
 Think about JSON Schema keywords while imlplementing this
 Think about references and reusable definitions
 
+why do we need a public method here. effectively base class just provides a method for implementation clases to override and add specific behavior
+
+instead should the base class just make it easy and only provide options for param name change ? the rest of the behavior is implemented as a feature based on config values isnt it ? what do u think ?
+
+lets take a simillar line of thinking for this function _process_window. should this be implementation specific or we should be implementing this in base class ? can u have a look
+
+on second thoughts, if the method override is only to provide parameter names, shouldnt this be implemented as part of our config. look through all pagination strategies used and suggest a solution
+
+again i still dont understand why are u changing this when it worked before..there was no issue in extractor. all we did was move pagination logic to config file. so there has to be a problem in the base.py implementation or the way our test class is passing the config
+werent we using since and until before with link strategy
+
 lets cleanup the codebase a bit before adding more features.. Consider the following:
 We are not using scheduling functionality in our pipeline. that sits outside of our ingestion pipeline.
 We need to store state outside of our implementation since this is serverless, stateless and multiple instance - potentially using bigquery/firestore/cloudsql for state management.
@@ -124,6 +135,10 @@ trace each print statement and the name of the metric used in lookup to the base
 
 this is what i see in base.py shouldnt we just be using this without worrying about how its calculated since it has a base value ? 
 if we see anomolies, we will get to the calculations
+
+can we test parelell execution by using start and end time for each window execution and look through timestamps.. change our config values to 7 days if required
+
+now how does this translate to output can output be written in parelell based on batch size so we reduce memory footprint ? change batch size in our test so we can test this in action
 
 ****** some doco prompts
 write a document on the system design and place it in docs folder
