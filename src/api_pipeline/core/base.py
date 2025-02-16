@@ -760,7 +760,9 @@ class BaseExtractor(ABC):
         
         if not items:
             window_end_time = time.time()
-            logger.info(f"Window processing completed in {window_end_time - window_start_time:.2f} seconds")
+            processing_time = window_end_time - window_start_time
+            self._metrics['total_processing_time'] += processing_time
+            logger.info(f"Window processing completed in {processing_time:.2f} seconds")
             return []
         
         # Transform items in parallel
@@ -770,6 +772,9 @@ class BaseExtractor(ABC):
         
         window_end_time = time.time()
         processing_time = window_end_time - window_start_time
+        self._metrics['total_processing_time'] += processing_time
+        self._metrics['items_processed'] += len(transformed_items)
+        
         logger.info(f"Window processing completed in {processing_time:.2f} seconds")
         logger.info(f"Transformed {len(transformed_items)} items")
         if transformed_items:
