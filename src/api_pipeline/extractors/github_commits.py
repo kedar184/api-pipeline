@@ -1,119 +1,75 @@
-from datetime import datetime, timezone, UTC, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, UTC
+from typing import Dict, List, Any, Optional
 import aiohttp
 from loguru import logger
-import asyncio
-
-from api_pipeline.core.base import BaseExtractor
-from api_pipeline.core.auth import create_auth_handler
-
+from api_pipeline.core.base import (
+    BaseExtractor,
+    ExtractorConfig,
+    PaginationConfig,
+    PaginationType,
+    ParallelProcessingStrategy,
+    TimeWindowParallelConfig,
+    ProcessingPattern
+)
+from api_pipeline.core.utils import parse_datetime
 
 class GitHubCommitsExtractor(BaseExtractor):
-    """Extracts repository commits with watermark-based incremental loading."""
+    """Extractor for GitHub repository commits.
     
-    def __init__(self, config):
+    This extractor fetches commits from a GitHub repository using their REST API.
+    It supports:
+    - Time-based filtering using 'since' and 'until' parameters
+    - Link-based pagination for efficient retrieval of large commit histories
+    - Watermarking for incremental updates
+    
+    The extractor uses a SINGLE processing pattern as GitHub's API returns
+    multiple commits in one request, rather than requiring separate requests
+    for each commit.
+    
+    Required URL parameters:
+    - repo: The repository in format "owner/repo" (e.g., "apache/spark")
+    """
+    
+    def __init__(self, config: ExtractorConfig):
+        # Ensure the endpoint template is set
+        if "current" not in config.endpoints:
+            config.endpoints["current"] = "/repos/{repo}/commits"
         super().__init__(config)
-        self._watermark_store = {}  # In-memory store for demo, use proper storage in production
-    
-    def _validate(self, parameters: Optional[Dict[str, Any]] = None) -> None:
-        """Validate GitHub-specific parameters."""
-        parameters = parameters or {}
+
+    def _get_url_params(self, parameters: Dict[str, Any]) -> Dict[str, str]:
+        """Get URL template parameters from the request parameters.
         
-        # Validate repository format if provided
-        repo = parameters.get("repo")
-        if repo and not isinstance(repo, str):
-            raise self.ValidationError("Repository must be a string in format 'owner/repo'")
-        if repo and '/' not in repo:
-            raise self.ValidationError("Repository must be in format 'owner/repo'")
-    
-    def _get_additional_headers(self) -> Dict[str, str]:
-        """Add GitHub-specific headers."""
+        This method extracts values needed for the URL template (e.g. {repo})
+        from the request parameters. These values are used to construct the
+        final URL path.
+        Example:
+            If endpoint template is "/repos/{repo}/commits" and parameters
+            contains {"repo": "apache/spark"}, this returns {"repo": "apache/spark"}
+        """
         return {
-            "Accept": "application/vnd.github.v3+json"
+            "repo": parameters["repo"]  # Required by _validate
         }
-
-    def _get_watermark_key(self) -> str:
-        """Use repository name as watermark key."""
-        return self.config.endpoints.get("repo", "default")
-
-    def _get_endpoint_override(self, parameters: Dict[str, Any]) -> Optional[str]:
-        """Get GitHub-specific endpoint with repository path."""
-        repo = parameters.get("repo")  # Get repo without removing it
-        if repo:
-            return f"/repos/{repo}/commits"
-        return None
 
     async def _transform_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
-        """Transform a commit into standardized format."""
-        return {
-            "commit_id": item["sha"],
-            "repo_name": self.config.endpoints["repo"],
-            "author_name": item["commit"]["author"]["name"],
-            "author_email": item["commit"]["author"]["email"],
-            "message": item["commit"]["message"],
-            "commit_url": item["html_url"],
-            "committed_at": datetime.strptime(
-                item["commit"]["author"]["date"],
-                "%Y-%m-%dT%H:%M:%SZ"
-            ).replace(tzinfo=UTC),
-            "files_changed": len(item.get("files", [])) if "files" in item else None,
-            "additions": item.get("stats", {}).get("additions"),
-            "deletions": item.get("stats", {}).get("deletions"),
-            "processed_at": datetime.now(UTC)
-        }
-
-    async def extract(self, parameters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        """Extract commits with parallel window processing."""
+        """Transform a single commit from the API response.
+        
+        """
         try:
-            await self._ensure_session()
-            parameters = parameters or {}
-            
-            # Get repository path
-            repo_path = parameters.get("repo", "apache/spark")
-            self.config.endpoints["repo"] = repo_path
-            
-            # Use watermark-based extraction
-            if self.config.watermark and self.config.watermark.enabled:
-                self._current_watermark = await self._get_last_watermark()
-                start_time = self._current_watermark
-                
-                # Calculate window bounds
-                windows = self._get_window_bounds(start_time)
-                logger.info(f"Processing {len(windows)} windows from {start_time}")
-                
-                # Process windows in parallel with concurrency limit
-                semaphore = asyncio.Semaphore(self.config.max_concurrent_requests)
-                async def process_with_semaphore(window):
-                    async with semaphore:
-                        return await self._process_window(window[0], window[1], parameters)
-                
-                window_results = await asyncio.gather(
-                    *[process_with_semaphore(window) for window in windows]
-                )
-                
-                # Flatten results and update watermark
-                all_data = [item for sublist in window_results for item in sublist]
-                
-                if all_data:
-                    max_watermark = max(
-                        commit["committed_at"] for commit in all_data
-                    )
-                    if max_watermark > start_time:
-                        await self._update_watermark(max_watermark)
-                
-                return all_data
-            
-            else:
-                # Non-watermark based extraction
-                commits = await self._paginated_request(
-                    "commits",
-                    params=parameters,
-                    endpoint_override=f"/repos/{repo_path}/commits"
-                )
-                
-                return [await self._transform_item(commit) for commit in commits]
-                
-        finally:
-            if self.session:
-                await self.session.close()
-                self.session = None 
+            return {
+                "commit_id": item["sha"],
+                "committed_at": parse_datetime(item["commit"]["author"]["date"]),
+                "author_name": item["commit"]["author"]["name"],
+                "author_email": item["commit"]["author"]["email"],
+                "message": item["commit"]["message"],
+                "url": item["html_url"]
+            }
+        except KeyError as e:
+            logger.error(f"Failed to transform commit: {str(e)}")
+            logger.error(f"Received item: {item}")
+            raise
+
+    def _validate(self, parameters: Optional[Dict[str, Any]] = None) -> None:
+        """Validate extraction parameters.
+        """
+        if not parameters or "repo" not in parameters:
+            raise self.ValidationError("Repository parameter 'repo' is required")

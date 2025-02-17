@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import asyncio
 import time
@@ -13,7 +14,10 @@ from api_pipeline.core.base import (
     WindowConfig,
     WindowType,
     PaginationType,
-    OutputConfig
+    OutputConfig,
+    ParallelProcessingStrategy,
+    TimeWindowParallelConfig,
+    ProcessingPattern
 )
 from api_pipeline.core.auth import AuthConfig
 from pathlib import Path
@@ -23,40 +27,46 @@ def test_config():
     return ExtractorConfig(
         base_url="https://api.github.com",
         endpoints={
-            "commits": "/repos/{repo}/commits"
+            "current": "/repos/{repo}/commits"  # URL template with repo parameter
         },
         auth_config=AuthConfig(
             auth_type="bearer",
             auth_credentials={"token": "placeholder"}  # Will be replaced with real token
         ),
+        # Explicitly set SINGLE processing pattern as we get multiple commits in one request
+        processing_pattern=ProcessingPattern.SINGLE,
+        
         # Performance optimizations
         batch_size=50,  # Increased batch size for fewer API calls
         max_concurrent_requests=5,  # Reduced for better visualization of parallel execution
         session_timeout=30,
         
-        # Pagination optimization
+        # Pagination configuration with parallel processing
         pagination=PaginationConfig(
             enabled=True,
-            strategy=PaginationType.PAGE_NUMBER,
-            page_size=100,  # Maximum page size for GitHub API
-            max_pages=10
+            strategy=PaginationType.LINK,  # GitHub uses Link headers for pagination
+            parallel_strategy=ParallelProcessingStrategy.TIME_WINDOWS,
+            parallel_config=TimeWindowParallelConfig(
+                window_size="24h",
+                window_overlap="0m",
+                max_concurrent_windows=5,
+                timestamp_format="%Y-%m-%dT%H:%M:%SZ"
+            ),
+            start_time_param="since",
+            end_time_param="until",
+            page_size=100  # Maximum page size for GitHub API
         ),
         
-        # Window configuration for efficient processing
+        # Watermark configuration for incremental processing
         watermark=WatermarkConfig(
             enabled=True,
             timestamp_field="committed_at",  # Match the field in our transformed data
-            window=WindowConfig(
-                window_type=WindowType.FIXED,
-                window_size="24h",  # 24-hour windows for 7-day period
-                window_offset="0m",
-                timestamp_field="committed_at"
-            ),
-            start_time_param="since",  # GitHub's parameter name
-            end_time_param="until",    # GitHub's parameter name
+            initial_watermark=datetime.now(UTC) - timedelta(days=7),  # Look back 7 days
             time_format="%Y-%m-%dT%H:%M:%SZ",  # GitHub's expected time format
-            initial_watermark=datetime.now(UTC) - timedelta(days=7)  # Look back 7 days
-        ),        
+            start_time_param="since",  # GitHub's parameter name
+            end_time_param="until"     # GitHub's parameter name
+        ),
+        
         # Retry configuration
         retry=RetryConfig(
             max_attempts=3,
@@ -167,5 +177,4 @@ async def main():
         await output_handler.close()
 
 if __name__ == "__main__":
-    test_config()  # Run the test first
-    asyncio.run(main())
+    asyncio.run(main())  # Run main directly when script is executed

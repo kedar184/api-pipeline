@@ -140,6 +140,13 @@ can we test parelell execution by using start and end time for each window execu
 
 now how does this translate to output can output be written in parelell based on batch size so we reduce memory footprint ? change batch size in our test so we can test this in action
 
+again define the intent by tracing through a call
+
+now lets tackle this method. take a simillar line of reasonining
+
+has all things together . do you think the pattern we have used for ParallelProcessingStrategy is better ?
+Using strategy pattern may keep the code clean and extensible.
+
 ****** some doco prompts
 write a document on the system design and place it in docs folder
 In system design, can u clearly explain the class diagram for all files in core and how they interact with each other to help the framework being extensible

@@ -13,6 +13,16 @@ import backoff
 from api_pipeline.core.auth import AuthConfig, create_auth_handler
 
 
+class ProcessingPattern(str, Enum):
+    """Defines how the extractor processes items.
+    
+    BATCH: Process multiple items, each requiring its own API call (e.g., /api/user/{id})
+    SINGLE: Process one request that returns multiple items (e.g., /api/users?page=1)
+    """
+    BATCH = "batch"
+    SINGLE = "single"
+
+
 class PaginationType(str, Enum):
     """Supported pagination types."""
     PAGE_NUMBER = "page_number"  # e.g., ?page=1&per_page=100
@@ -22,33 +32,218 @@ class PaginationType(str, Enum):
     LINK = "link"               # Uses Link headers (like GitHub)
 
 
+class ParallelProcessingStrategy(Enum):
+    NONE = "none"
+    TIME_WINDOWS = "time_windows"
+    KNOWN_PAGES = "known_pages"
+    CALCULATED_OFFSETS = "calculated_offsets"
+
+
+class TimeWindowParallelConfig(BaseModel):
+    """Configuration for time-based parallel processing"""
+    window_size: str = "24h"  # e.g., "24h", "7d"
+    window_overlap: str = "0m"  # overlap between windows
+    max_concurrent_windows: int = 5
+    timestamp_format: str = "%Y-%m-%dT%H:%M:%SZ"
+
+
+class KnownPagesParallelConfig(BaseModel):
+    """Configuration for page-based parallel processing"""
+    max_concurrent_pages: int = 5
+    require_total_count: bool = True
+    safe_page_size: int = 100
+
+
+class CalculatedOffsetParallelConfig(BaseModel):
+    """Configuration for offset-based parallel processing"""
+    max_concurrent_chunks: int = 5
+    chunk_size: int = 1000
+    require_total_count: bool = True
+
+
+ParallelConfig = Union[
+    TimeWindowParallelConfig,
+    KnownPagesParallelConfig,
+    CalculatedOffsetParallelConfig
+]
+
+
+class PaginationStrategy(ABC):
+    """Abstract base class for pagination strategies."""
+    
+    @abstractmethod
+    async def get_next_page_params(self, 
+        current_params: Dict[str, Any],
+        response: Dict[str, Any],
+        page_number: int
+    ) -> Optional[Dict[str, Any]]:
+        """Get parameters for the next page based on current response.
+        
+        Args:
+            current_params: Current request parameters
+            response: Current page response
+            page_number: Current page number (1-based)
+            
+        Returns:
+            Parameters for next page, or None if no more pages
+        """
+        pass
+    
+    @abstractmethod
+    def get_initial_params(self, base_params: Dict[str, Any], page_size: int) -> Dict[str, Any]:
+        """Get parameters for the first page.
+        
+        Args:
+            base_params: Base request parameters
+            page_size: Number of items per page
+            
+        Returns:
+            Parameters for first page
+        """
+        pass
+
+
+class PageNumberStrategy(PaginationStrategy):
+    """Strategy for page number based pagination."""
+    
+    def __init__(self, page_param: str = "page", size_param: str = "per_page"):
+        self.page_param = page_param
+        self.size_param = size_param
+    
+    async def get_next_page_params(self, 
+        current_params: Dict[str, Any],
+        response: Dict[str, Any],
+        page_number: int
+    ) -> Optional[Dict[str, Any]]:
+        # If we got a full page, there might be more
+        items = response if isinstance(response, list) else []
+        if len(items) >= current_params[self.size_param]:
+            params = current_params.copy()
+            params[self.page_param] = page_number + 1
+            return params
+        return None
+    
+    def get_initial_params(self, base_params: Dict[str, Any], page_size: int) -> Dict[str, Any]:
+        params = base_params.copy()
+        params[self.page_param] = 1
+        params[self.size_param] = page_size
+        return params
+
+
+class CursorStrategy(PaginationStrategy):
+    """Strategy for cursor based pagination."""
+    
+    def __init__(self, cursor_param: str = "cursor", cursor_field: str = "next_cursor"):
+        self.cursor_param = cursor_param
+        self.cursor_field = cursor_field
+    
+    async def get_next_page_params(self,
+        current_params: Dict[str, Any],
+        response: Dict[str, Any],
+        page_number: int
+    ) -> Optional[Dict[str, Any]]:
+        next_cursor = response.get(self.cursor_field)
+        if next_cursor:
+            params = current_params.copy()
+            params[self.cursor_param] = next_cursor
+            return params
+        return None
+    
+    def get_initial_params(self, base_params: Dict[str, Any], page_size: int) -> Dict[str, Any]:
+        return base_params.copy()  # Cursor usually doesn't need initial params
+
+
+class LinkHeaderStrategy(PaginationStrategy):
+    """Strategy for Link header based pagination (like GitHub)."""
+    
+    async def get_next_page_params(self,
+        current_params: Dict[str, Any],
+        response: Dict[str, Any],
+        page_number: int
+    ) -> Optional[Dict[str, Any]]:
+        # Extract next link from Link header
+        links = response.get("headers", {}).get("Link", "")
+        for link in links.split(","):
+            if 'rel="next"' in link:
+                url = link.split(";")[0].strip()[1:-1]
+                # Parse URL params into dict
+                from urllib.parse import urlparse, parse_qs
+                parsed = urlparse(url)
+                params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+                return params
+        return None
+    
+    def get_initial_params(self, base_params: Dict[str, Any], page_size: int) -> Dict[str, Any]:
+        return base_params.copy()
+
+
+class OffsetStrategy(PaginationStrategy):
+    """Strategy for offset based pagination."""
+    
+    def __init__(self, offset_param: str = "offset", limit_param: str = "limit"):
+        self.offset_param = offset_param
+        self.limit_param = limit_param
+    
+    async def get_next_page_params(self,
+        current_params: Dict[str, Any],
+        response: Dict[str, Any],
+        page_number: int
+    ) -> Optional[Dict[str, Any]]:
+        current_offset = current_params.get(self.offset_param, 0)
+        limit = current_params[self.limit_param]
+        items = response if isinstance(response, list) else []
+        
+        if len(items) >= limit:
+            params = current_params.copy()
+            params[self.offset_param] = current_offset + limit
+            return params
+        return None
+    
+    def get_initial_params(self, base_params: Dict[str, Any], page_size: int) -> Dict[str, Any]:
+        params = base_params.copy()
+        params[self.offset_param] = 0
+        params[self.limit_param] = page_size
+        return params
+
+
 class PaginationConfig(BaseModel):
-    """Configuration for API pagination."""
+    """Enhanced pagination configuration with strategy pattern."""
     enabled: bool = True
-    strategy: PaginationType = PaginationType.PAGE_NUMBER
+    strategy: PaginationStrategy
     page_size: int = 100
     max_pages: Optional[int] = None
     
-    # Page number strategy
-    page_param: str = "page"
-    size_param: str = "per_page"
+    @classmethod
+    def with_page_numbers(cls, page_size: int = 100, **kwargs) -> 'PaginationConfig':
+        """Factory method for page number pagination."""
+        return cls(
+            strategy=PageNumberStrategy(**kwargs),
+            page_size=page_size
+        )
     
-    # Cursor strategy
-    cursor_param: str = "cursor"
-    cursor_field: str = "next_cursor"
+    @classmethod
+    def with_cursor(cls, page_size: int = 100, **kwargs) -> 'PaginationConfig':
+        """Factory method for cursor-based pagination."""
+        return cls(
+            strategy=CursorStrategy(**kwargs),
+            page_size=page_size
+        )
     
-    # Offset strategy
-    offset_param: str = "offset"
-    limit_param: str = "limit"
+    @classmethod
+    def with_offset(cls, page_size: int = 100, **kwargs) -> 'PaginationConfig':
+        """Factory method for offset-based pagination."""
+        return cls(
+            strategy=OffsetStrategy(**kwargs),
+            page_size=page_size
+        )
     
-    # Token strategy
-    token_param: str = "page_token"
-    next_token_field: str = "next_page_token"
-    
-    # Response parsing
-    items_field: str = "items"  # Field containing items in response
-    total_field: Optional[str] = None  # Field containing total items count
-    has_more_field: Optional[str] = None  # Field indicating more pages
+    @classmethod
+    def with_link_header(cls, page_size: int = 100) -> 'PaginationConfig':
+        """Factory method for Link header pagination."""
+        return cls(
+            strategy=LinkHeaderStrategy(),
+            page_size=page_size
+        )
 
 
 class RetryConfig(BaseModel):
@@ -132,8 +327,10 @@ class WatermarkConfig(BaseModel):
 
 class ExtractorConfig(BaseModel):
     base_url: str
-    endpoints: Dict[str, str]
+    endpoints: Dict[str, str]  # URL templates with {param} placeholders
     auth_config: AuthConfig
+    processing_pattern: ProcessingPattern = ProcessingPattern.SINGLE
+    batch_parameter_name: Optional[str] = None
     rate_limit: Optional[int] = None
     retry_count: Optional[int] = None
     batch_size: int = 100
@@ -141,7 +338,7 @@ class ExtractorConfig(BaseModel):
     session_timeout: int = 30
     pagination: Optional[PaginationConfig] = None
     retry: RetryConfig = RetryConfig()
-    watermark: Optional[WatermarkConfig] = None  # Add watermark configuration
+    watermark: Optional[WatermarkConfig] = None
 
 
 class BaseExtractor(ABC):
@@ -317,7 +514,7 @@ class BaseExtractor(ABC):
         params: Optional[Dict[str, Any]] = None,
         endpoint_override: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Make paginated requests with support for different pagination strategies."""
+        """Make paginated requests using the configured pagination strategy."""
         await self._ensure_session()
         all_results = []
         
@@ -325,31 +522,17 @@ class BaseExtractor(ABC):
             response = await self._make_request(endpoint, params, endpoint_override)
             return self._extract_items(response)
 
-        pagination = self.config.pagination
-        page_params = {**(params or {})}
+        # Get initial parameters from the strategy
+        page_params = self.config.pagination.strategy.get_initial_params(
+            params or {}, 
+            self.config.pagination.page_size
+        )
         page_count = 0
-        next_token = None
 
-        logger.info(f"Starting paginated request with strategy: {pagination.strategy}")
+        logger.info(f"Starting paginated request with strategy: {self.config.pagination.strategy.__class__.__name__}")
         logger.info(f"Initial parameters: {page_params}")
 
         while True:
-            # Update parameters based on pagination strategy
-            if pagination.strategy == PaginationType.PAGE_NUMBER:
-                page_params.update({
-                    pagination.page_param: page_count + 1,
-                    pagination.size_param: pagination.page_size
-                })
-            elif pagination.strategy == PaginationType.CURSOR and next_token:
-                page_params[pagination.cursor_param] = next_token
-            elif pagination.strategy == PaginationType.OFFSET:
-                page_params.update({
-                    pagination.offset_param: page_count * pagination.page_size,
-                    pagination.limit_param: pagination.page_size
-                })
-            elif pagination.strategy == PaginationType.TOKEN and next_token:
-                page_params[pagination.token_param] = next_token
-
             try:
                 logger.info(f"Making request for page {page_count + 1} with params: {page_params}")
                 async with self._semaphore:
@@ -360,17 +543,21 @@ class BaseExtractor(ABC):
                 all_results.extend(items)
                 page_count += 1
 
-                # Get next token based on strategy
-                next_token = self._get_next_token(response, pagination)
-                logger.info(f"Next token: {next_token}")
-                
-                # Check if we should continue
-                should_continue = self._should_continue_pagination(
-                    response, items, page_count, next_token, pagination
+                # Get next page parameters from the strategy
+                next_params = await self.config.pagination.strategy.get_next_page_params(
+                    page_params,
+                    response,
+                    page_count
                 )
-                logger.info(f"Should continue pagination: {should_continue}")
-                if not should_continue:
+                
+                # If no next parameters, we're done
+                if not next_params or (
+                    self.config.pagination.max_pages and 
+                    page_count >= self.config.pagination.max_pages
+                ):
                     break
+
+                page_params = next_params
 
             except Exception as e:
                 logger.error(f"Pagination request failed: {str(e)}")
@@ -606,12 +793,64 @@ class BaseExtractor(ABC):
                 self.session = None
 
     def _get_items_to_process(self, parameters: Dict[str, Any]) -> List[Any]:
-        """Get items to process from parameters. Override in subclass if needed."""
-        # Default implementation looks for common parameter names
-        for param in ['items', 'ids', 'locations', 'location_ids']:
-            if param in parameters:
-                return parameters[param]
-        return []
+        """Get items to process based on the configured processing pattern.
+        
+        For BATCH pattern:
+            Returns the list of items from the configured batch_parameter_name.
+            Each item will get its own API call.
+            
+        For SINGLE pattern:
+            Returns [parameters] to make a single API call that returns multiple items.
+            
+        Override this method if you need custom item processing logic.
+        """
+        if self.config.processing_pattern == ProcessingPattern.BATCH:
+            if not self.config.batch_parameter_name:
+                raise ValueError("batch_parameter_name must be set for BATCH processing pattern")
+                
+            items = parameters.get(self.config.batch_parameter_name)
+            if not items:
+                logger.warning(f"No items found in parameter '{self.config.batch_parameter_name}'")
+                return []
+                
+            if not isinstance(items, list):
+                raise ValueError(f"Parameter '{self.config.batch_parameter_name}' must be a list")
+                
+            return items
+            
+        # SINGLE pattern - use parameters as is
+        return [parameters]
+
+    def _get_url(self, endpoint: str, params: Dict[str, Any], endpoint_override: Optional[str] = None) -> str:
+        """Construct the full URL for a request.
+        
+        Handles URL template parameters in the format {param_name}.
+        Example: "/repos/{repo}/commits" with params={"repo": "apache/spark"}
+        becomes "/repos/apache/spark/commits"
+        
+        Args:
+            endpoint: The endpoint key from config.endpoints
+            params: Request parameters, used both for URL template and query params
+            endpoint_override: Optional override for the entire endpoint path
+            
+        Returns:
+            The complete URL with template parameters replaced
+            
+        Raises:
+            ValueError: If a template parameter is missing from params
+        """
+        if endpoint_override:
+            path = endpoint_override
+        else:
+            path = self.config.endpoints[endpoint]
+            
+        try:
+            # Format the URL template with provided parameters
+            path = path.format(**params)
+        except KeyError as e:
+            raise ValueError(f"Missing required URL parameter: {e}")
+            
+        return f"{self.config.base_url}{path}"
 
     async def _make_request(
         self,
@@ -620,9 +859,8 @@ class BaseExtractor(ABC):
         endpoint_override: Optional[str] = None
     ) -> Dict[str, Any]:
         """Make a single request with retries and rate limiting."""
-        url = (f"{self.config.base_url}{endpoint_override}"
-               if endpoint_override
-               else f"{self.config.base_url}{self.config.endpoints[endpoint]}")
+        params = params or {}
+        url = self._get_url(endpoint, params, endpoint_override)
         
         async with self.session.get(url, params=params) as response:
             response.raise_for_status()
@@ -782,6 +1020,98 @@ class BaseExtractor(ABC):
             logger.info(f"Sample transformed item timestamp: {first_item.get(self.config.watermark.timestamp_field)}")
         
         return transformed_items
+
+    async def _process_parallel(self, parameters: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Process data in parallel based on the configured strategy"""
+        if not self.config.pagination.parallel_strategy or \
+           self.config.pagination.parallel_strategy == ParallelProcessingStrategy.NONE:
+            return await self._process_sequential(parameters)
+
+        if self.config.pagination.parallel_strategy == ParallelProcessingStrategy.TIME_WINDOWS:
+            return await self._process_time_windows(parameters)
+        elif self.config.pagination.parallel_strategy == ParallelProcessingStrategy.KNOWN_PAGES:
+            return await self._process_known_pages(parameters)
+        elif self.config.pagination.parallel_strategy == ParallelProcessingStrategy.CALCULATED_OFFSETS:
+            return await self._process_calculated_offsets(parameters)
+        
+        raise ValueError(f"Unsupported parallel strategy: {self.config.pagination.parallel_strategy}")
+
+    async def _process_time_windows(self, parameters: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Process data using time-based windowing"""
+        if not isinstance(self.config.pagination.parallel_config, TimeWindowParallelConfig):
+            raise ValueError("Time window configuration required for time-based parallel processing")
+
+        config = self.config.pagination.parallel_config
+        start_time = self._get_start_time(parameters)
+        end_time = self._get_end_time(parameters)
+        
+        # Calculate time windows
+        windows = self._calculate_time_windows(start_time, end_time, config)
+        logger.info(f"Processing {len(windows)} time windows from {start_time} to {end_time}")
+        
+        # Process windows in parallel with concurrency limit
+        semaphore = asyncio.Semaphore(config.max_concurrent_windows)
+        async def process_window_with_semaphore(window_start, window_end):
+            async with semaphore:
+                window_params = parameters.copy()
+                window_params[self.config.pagination.start_time_param] = window_start.strftime(config.timestamp_format)
+                window_params[self.config.pagination.end_time_param] = window_end.strftime(config.timestamp_format)
+                return await self._process_sequential(window_params)
+        
+        tasks = [
+            process_window_with_semaphore(start, end)
+            for start, end in windows
+        ]
+        
+        results = await asyncio.gather(*tasks)
+        return [item for sublist in results for item in sublist]  # Flatten results
+
+    def _calculate_time_windows(
+        self, 
+        start_time: datetime, 
+        end_time: datetime, 
+        config: TimeWindowParallelConfig
+    ) -> List[Tuple[datetime, datetime]]:
+        """Calculate time windows for parallel processing"""
+        window_size = self.config.pagination.parallel_config.window_size_seconds
+        window_overlap = self.config.pagination.parallel_config.window_overlap_seconds
+        
+        windows = []
+        current_start = start_time
+        
+        while current_start < end_time:
+            window_end = min(current_start + window_size, end_time)
+            windows.append((current_start, window_end))
+            current_start = window_end - window_overlap
+        
+        return windows
+
+    def _get_start_time(self, parameters: Dict[str, Any]) -> datetime:
+        """Get start time from parameters or use default"""
+        if self.config.pagination.start_time_param in parameters:
+            return parse_datetime(parameters[self.config.pagination.start_time_param])
+        return datetime.now(UTC) - timedelta(days=7)  # Default to last 7 days
+
+    def _get_end_time(self, parameters: Dict[str, Any]) -> datetime:
+        """Get end time from parameters or use default"""
+        if self.config.pagination.end_time_param in parameters:
+            return parse_datetime(parameters[self.config.pagination.end_time_param])
+        return datetime.now(UTC)
+
+    async def _process_known_pages(self, parameters: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Process data using parallel page fetching"""
+        # Implementation for page-based parallel processing
+        raise NotImplementedError("Page-based parallel processing not implemented yet")
+
+    async def _process_calculated_offsets(self, parameters: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Process data using parallel offset fetching"""
+        # Implementation for offset-based parallel processing
+        raise NotImplementedError("Offset-based parallel processing not implemented yet")
+
+    async def _process_sequential(self, parameters: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Process data sequentially (existing pagination logic)"""
+        # Move existing pagination logic here
+        raise NotImplementedError("Sequential processing must be implemented by subclass")
 
 
 class OutputConfig(BaseModel):
