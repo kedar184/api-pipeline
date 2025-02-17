@@ -1,871 +1,772 @@
 # API Pipeline System Design
 
-## Overview
+## I. Overview
 
-The API Pipeline system is a scalable and extensible framework for extracting data from various APIs and loading it into different output destinations. The system is designed with modularity, flexibility, and reliability in mind.
+A framework for extracting data from APIs and loading it into output destinations. 
 
-## Architecture
+### Key Features
+- Chain-based orchestration for API data extraction
+- Individual pipeline management for single extractors
+- Core framework with extensible components
+- Reliable error handling and retries
+- Built-in monitoring and metrics
+
+## II. Architecture
 
 ### High-Level Components
 
 ```
-┌─────────────────┐     ┌──────────────┐     ┌────────────────┐
-│  API Sources    │     │   Pipeline    │     │    Outputs     │
-│  (REST/GraphQL) │────▶│   Manager    │────▶│ (BigQuery/GCS) │
-└─────────────────┘     └──────────────┘     └────────────────┘
-                              │
-                        ┌─────┴─────┐
-                        │   Config   │
-                        │   Store    │
-                        └───────────┘
+                                Chain Layer
+┌────────────────────────────────────────────────────────────┐
+│                                                            │
+│   ┌──────────────┐          ┌──────────────┐              │
+│   │   Chain      │          │    State     │              │
+│   │  Executor    │◄────────►│   Manager    │              │
+│   └──────┬───────┘          └──────────────┘              │
+│          │                                                 │
+└──────────┼─────────────────────────────────────────────────┘
+           │
+           │ orchestrates 1:N pipelines
+           │
+           ▼
+┌─────────────────── Base Pipeline ──────────────────────────┐
+│                                                            │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐ │
+│  │  Extractor   │───►│   Pipeline   │───►│    Output    │ │
+│  └──────────────┘    │   Manager    │    └──────────────┘ │
+│                      └──────────────┘                      │
+└────────────────────────────────────────────────────────────┘
 ```
 
-### Core Components
+### Component Interaction
 
-1. **Pipeline Factory**
-   - Creates pipeline instances
-   - Manages component lifecycle
-   - Handles configuration
-   - Provides component registration
+```mermaid
+sequenceDiagram
+    participant CE as Chain Executor
+    participant PM as Pipeline Manager
+    participant E as Extractor
+    participant O as Output
 
-2. **Authentication System**
-   - OAuth 2.0 with refresh tokens
-   - API key authentication
-   - Extensible auth handlers
-   - Secure secret management
+    CE->>PM: execute_pipeline()
+    PM->>E: extract()
+    E-->>PM: data
+    PM->>O: write()
+    O-->>PM: success
+    PM-->>CE: result
+```
 
-3. **Extractors**
-   - Data source abstraction
-   - Concurrent processing
-   - Rate limiting
-   - Error handling
-   - Modular components:
-     - Retry handling
-     - Watermark tracking
-     - Pagination strategies
-     - Parallel processing
-     - Window management
-
-4. **Outputs**
-   - BigQuery integration
-   - GCS support
-   - Local development output
-   - Schema validation
-   - Modular output handlers
-
-5. **Pipeline Manager**
-   - Orchestration
-   - Status tracking
-   - Error handling
-   - Metrics collection
-   - Component coordination
-
-6. **Core Modules**
-   - `retry.py`: Retry mechanisms and configurations
-   - `watermark.py`: Watermark tracking and window management
-   - `pagination.py`: Pagination strategies and configurations
-   - `parallel.py`: Parallel processing configurations
-   - `windowing.py`: Time window calculations and management
-   - `output.py`: Output handling and configurations
-   - `auth.py`: Authentication handlers and configurations
-   - `base.py`: Core extractor and output base classes
-
-## Core Components Class Diagram
+### Class Diagram
 
 ```mermaid
 classDiagram
+    ChainExecutor --> PipelineManager : orchestrates
+    PipelineManager --> Pipeline : manages
+    Pipeline --> BaseExtractor : uses
+    Pipeline --> BaseOutput : uses
+
+    class ChainExecutor {
+        +execute_single_chain()
+        +execute_parallel_chains()
+    }
+
     class PipelineManager {
-        +Dict[str, PipelineConfig] pipelines
-        +Dict[str, PipelineRun] runs
-        +list_pipelines()
-        +get_pipeline_status()
+        +register_pipeline()
         +execute_pipeline()
-        +trigger_pipeline()
-        +get_run_status()
+        +write_output()
+    }
+
+    class Pipeline {
+        +execute()
+        +get_status()
     }
 
     class BaseExtractor {
         <<abstract>>
-        +ExtractorConfig config
-        +RetryHandler retry_handler
-        +WatermarkHandler watermark_handler
-        +extract(parameters)*
-        +get_metrics()
-        +cleanup()
-        #_process_batch()
-        #_paginated_request()
-        #_transform_item()*
+        +extract()
+        +extract_stream()
     }
 
     class BaseOutput {
         <<abstract>>
-        +OutputConfig config
-        +write(data)*
-        +close()*
-        +get_metrics()
-        +initialize()*
+        +write()
+        +write_stream()
     }
-
-    class RetryHandler {
-        +RetryConfig config
-        +RetryState state
-        +calculate_delay()
-        +should_retry()
-        +execute_with_retry()
-    }
-
-    class RetryState {
-        +Dict[str, Any] _state
-        +get_state()
-        +clear_state()
-        +clear_all()
-    }
-
-    class RetryConfig {
-        +int max_attempts
-        +int max_time
-        +float base_delay
-        +float max_delay
-        +bool jitter
-        +List[int] retry_on
-    }
-
-    class WatermarkHandler {
-        +WatermarkConfig config
-        +get_last_watermark()
-        +update_watermark()
-        +apply_watermark_filters()
-        +get_metrics()
-    }
-
-    class WatermarkConfig {
-        +bool enabled
-        +str timestamp_field
-        +str watermark_field
-        +WindowConfig window
-        +datetime initial_watermark
-        +str lookback_window
-        +str time_format
-    }
-
-    class WindowConfig {
-        +WindowType window_type
-        +str window_size
-        +str window_offset
-        +str window_overlap
-        +str timestamp_field
-        +window_size_seconds()
-        +window_offset_seconds()
-    }
-
-    class PaginationStrategy {
-        <<abstract>>
-        +get_next_page_params()*
-        +get_initial_params()*
-    }
-
-    class PaginationConfig {
-        +bool enabled
-        +PaginationStrategy strategy
-        +int page_size
-        +int max_pages
-        +with_page_numbers()$
-        +with_cursor()$
-        +with_offset()$
-        +with_link_header()$
-    }
-
-    class ParallelConfig {
-        <<interface>>
-    }
-
-    class TimeWindowParallelConfig {
-        +str window_size
-        +str window_overlap
-        +int max_concurrent_windows
-        +str timestamp_format
-        +window_size_seconds()
-        +window_overlap_seconds()
-    }
-
-    class KnownPagesParallelConfig {
-        +int max_concurrent_pages
-        +bool require_total_count
-        +int safe_page_size
-    }
-
-    class CalculatedOffsetParallelConfig {
-        +int max_concurrent_chunks
-        +int chunk_size
-        +bool require_total_count
-    }
-
-    class PipelineConfig {
-        +str pipeline_id
-        +str description
-        +bool enabled
-        +str extractor_class
-        +Dict api_config
-        +List[Dict] output
-    }
-
-    class PipelineRun {
-        +str run_id
-        +str pipeline_id
-        +str status
-        +datetime start_time
-        +datetime end_time
-        +int records_processed
-        +List[str] errors
-    }
-
-    class PipelineFactory {
-        +register_output()
-        +create_pipeline()
-    }
-
-    class ExtractorConfig {
-        +str base_url
-        +Dict endpoints
-        +AuthConfig auth_config
-        +ProcessingPattern pattern
-        +PaginationConfig pagination
-        +RetryConfig retry
-        +WatermarkConfig watermark
-        +ParallelConfig parallel_config
-    }
-
-    class AuthHandler {
-        <<abstract>>
-        +AuthConfig config
-        +get_auth_headers()*
-        +get_metrics()
-    }
-
-    class AuthConfig {
-        +str auth_type
-        +Dict auth_credentials
-        +str headers_prefix
-    }
-
-    class OAuthConfig {
-        +str token_url
-        +str client_id
-        +str client_secret
-        +str refresh_token
-        +str access_token
-        +datetime token_expiry
-        +bool auto_refresh
-    }
-
-    PipelineManager --> PipelineConfig : manages
-    PipelineManager --> PipelineRun : tracks
-    PipelineManager --> PipelineFactory : uses
-    PipelineFactory --> BaseExtractor : creates
-    PipelineFactory --> BaseOutput : creates
-    BaseExtractor --> RetryHandler : uses
-    BaseExtractor --> WatermarkHandler : uses
-    BaseExtractor --> PaginationStrategy : uses
-    BaseExtractor --> AuthHandler : uses
-    BaseExtractor --> ExtractorConfig : configured by
-    BaseExtractor <|-- WeatherExtractor : implements
-    BaseExtractor <|-- GitHubExtractor : implements
-    BaseOutput <|-- BigQueryOutput : implements
-    BaseOutput <|-- GCSOutput : implements
-    RetryHandler --> RetryConfig : configured by
-    RetryHandler --> RetryState : manages
-    WatermarkHandler --> WatermarkConfig : configured by
-    WatermarkConfig --> WindowConfig : uses
-    PaginationStrategy <|-- PageNumberStrategy : implements
-    PaginationStrategy <|-- CursorStrategy : implements
-    PaginationStrategy <|-- LinkHeaderStrategy : implements
-    PaginationStrategy <|-- OffsetStrategy : implements
-    AuthHandler <|-- OAuthHandler : implements
-    AuthHandler <|-- BearerAuth : implements
-    AuthHandler <|-- ApiKeyAuth : implements
-    AuthHandler --> AuthConfig : configured by
-    OAuthHandler --> OAuthConfig : configured by
-    ParallelConfig <|-- TimeWindowParallelConfig : implements
-    ParallelConfig <|-- KnownPagesParallelConfig : implements
-    ParallelConfig <|-- CalculatedOffsetParallelConfig : implements
-    ExtractorConfig --> ParallelConfig : uses
-    ExtractorConfig --> PaginationConfig : uses
-    PaginationConfig --> PaginationStrategy : uses
 ```
 
-## Core Components Interaction
+## III. Core Concepts
 
-### 1. Base Framework (`base.py`)
-- Provides abstract base classes `BaseExtractor` and `BaseOutput`
-- Defines core extraction and output interfaces
-- Coordinates component interactions
-- Manages component lifecycle
-- Delegates specialized functionality to dedicated modules
+### Chain vs Pipeline
+- **Chain**: Orchestrates multiple pipelines, manages state between steps
+- **Pipeline**: Handles single extractor-to-output flow, manages resources
 
-### 2. Retry System (`retry.py`)
-- Handles request retries with configurable strategies
-- Manages retry state and backoff calculations
-- Provides retry metrics and monitoring
-- Integrates with extractors for automatic retry handling
+### Processing Modes
+1. **Single**
+   - Direct processing of individual items
+   - Used for simple API calls
 
-### 3. Watermark System (`watermark.py`)
-- Tracks data processing progress
-- Manages incremental data extraction
-- Handles time-based windowing
-- Provides watermark metrics and monitoring
+2. **Sequential**
+   - Ordered processing of list items
+   - Maintains execution order
+   - Suitable for dependent operations
 
-### 4. Pagination System (`pagination.py`)
-- Implements various pagination strategies
-- Manages page state and continuation
-- Handles response parsing and validation
-- Supports dynamic strategy selection
+3. **Parallel**
+   - Concurrent processing of list items
+   - Configurable concurrency limits
+   - Best for independent operations
 
-### 5. Parallel Processing (`parallel.py`)
-- Configures parallel execution strategies
-- Manages concurrent request handling
-- Optimizes resource utilization
-- Provides performance monitoring
+### State Management
+- Chain state persists between steps
+- Pipeline state tracks execution
+- Watermarks for incremental processing
+- Error state for recovery
 
-### 6. Window Management (`windowing.py`)
-- Calculates time-based windows
-- Manages window boundaries and overlap
-- Supports different window types
-- Coordinates with watermark tracking
+### Error Handling
+- Configurable retry strategies
+- Per-step error policies
+- Chain-level recovery
+- Partial success handling
 
-### 7. Output System (`output.py`)
-- Manages output destinations
-- Handles data writing and validation
-- Provides output metrics and monitoring
-- Supports multiple output formats
+## IV. Implementation
 
-### 8. Authentication (`auth.py`)
-- Manages authentication methods
-- Handles token refresh and rotation
-- Provides secure credential management
-- Supports multiple auth strategies
+### Configuration Examples
 
-### 9. Data Models (`models.py`)
-- Defines core data structures
-- Ensures type safety and validation
-- Provides configuration models
-- Supports extensible schemas
-
-### 10. Factory Pattern (`factory.py`)
-- Creates component instances
-- Manages component registration
-- Handles configuration parsing
-- Enables plug-and-play architecture
-
-### 11. Pipeline Manager (`pipeline_manager.py`)
-- Orchestrates component interactions
-- Manages pipeline execution
-- Tracks pipeline status
-- Provides monitoring interface
-
-## Extensibility Points
-
-1. **Adding New Data Sources**
-   ```python
-   class NewAPIExtractor(BaseExtractor):
-       async def extract(self, parameters):
-           # Implementation for new API
-   ```
-
-2. **Adding New Outputs**
-   ```python
-   class NewOutput(BaseOutput):
-       async def write(self, data):
-           # Implementation for new destination
-   ```
-
-3. **Registering New Components**
-   ```python
-   PipelineFactory.register_output("new_type", NewOutput)
-   ```
-
-## Flow of Control
-
-1. **Pipeline Creation**
-   - `PipelineManager` loads configurations
-   - `PipelineFactory` creates components:
-     - Initializes auth handler
-     - Creates retry handler
-     - Sets up watermark handler
-     - Configures pagination strategy
-     - Prepares parallel processing
-     - Initializes output handlers
-   - Components are initialized with configs
-
-2. **Pipeline Execution**
-   - Manager triggers execution
-   - Watermark handler determines processing windows
-   - For each window:
-     - Parallel processor manages concurrent execution
-     - Extractor fetches data with pagination
-     - Retry handler manages failed requests
-     - Data flows through transforms
-   - Outputs write to destinations
-   - Watermark is updated
-
-3. **Component Interaction**
-   - Base extractor coordinates components
-   - Retry handler wraps HTTP requests
-   - Watermark handler tracks progress
-   - Pagination handles request continuation
-   - Window manager calculates boundaries
-   - Output handlers manage destinations
-
-4. **Status Tracking**
-   - Run status is updated
-   - Component metrics are collected:
-     - Retry statistics
-     - Watermark progress
-     - Pagination metrics
-     - Processing windows
-     - Output statistics
-   - Errors are captured and categorized
-
-## Design Benefits
-
-1. **Loose Coupling**
-   - Components interact through well-defined interfaces
-   - Implementation details are isolated in dedicated modules
-   - Easy to modify or replace individual components
-   - Clear separation between core and specialized functionality
-
-2. **High Cohesion**
-   - Each module has a single, focused responsibility
-   - Clear separation of concerns in dedicated files
-   - Easy to maintain and test individual components
-   - Simplified debugging and error tracking
-
-3. **Extensibility**
-   - New extractors can be added without modifying core
-   - New outputs can be integrated seamlessly
-   - Custom components can be easily plugged in
-   - Configurations are flexible and modular
-
-4. **Modularity**
-   - Specialized functionality in dedicated modules
-   - Clear interface boundaries between components
-   - Dependency injection for flexible configuration
-   - Factory pattern for component creation
-   - Easy to add new features in isolation
-
-5. **Maintainability**
-   - Clear organization of code by functionality
-   - Comprehensive documentation per module
-   - Type hints and validation throughout
-   - Consistent coding standards
-   - Isolated testing of components
-
-6. **Reusability**
-   - Common functionality extracted to shared modules
-   - Standardized interfaces across components
-   - Configurable components for different use cases
-   - Easy to share code between extractors
-
-## Design Principles
-
-1. **Modularity**
-   - Pluggable architecture
-   - Clear interface boundaries
-   - Dependency injection
-   - Factory pattern for components
-
-2. **Reliability**
-   - Error handling at all levels
-   - Retry mechanisms
-   - Comprehensive logging
-   - Transaction management
-
-3. **Scalability**
-   - Asynchronous operations
-   - Batch processing
-   - Resource pooling
-   - Configurable concurrency
-
-4. **Maintainability**
-   - Clear separation of concerns
-   - Comprehensive documentation
-   - Type hints and validation
-   - Consistent coding standards
-
-## Data Flow
-
-1. **Authentication**
-   - Load auth configuration
-   - Initialize auth handler
-   - Manage token lifecycle
-   - Secure header generation
-
-2. **Extraction**
-   - Authenticate requests
-   - Fetch data from source
-   - Handle pagination
-   - Transform data
-
-3. **Processing**
-   - Validate data
-   - Apply transformations
-   - Batch processing
-   - Error handling
-
-4. **Output**
-   - Write to destinations
-   - Schema enforcement
-   - Partitioning
-   - Cleanup
-
-## Configuration Management
-
-### Environment-Specific Config
+1. **Chain Configuration**
 ```yaml
-service:
-  name: api-pipeline
-  version: 1.0.0
-  log_level: INFO
+chain_id: example_chain
+extractors:
+  - extractor_class: FirstExtractor
+    processing_mode: single
+    input_mapping:
+      source_param: chain_input
+    output_mapping:
+      result: next_input
 
-rate_limits:
-  default_rps: 500
-  max_concurrent: 200
+  - extractor_class: SecondExtractor
+    processing_mode: parallel
+    input_mapping:
+      data: next_input
 ```
 
-### Pipeline Config
+2. **Pipeline Configuration**
 ```yaml
-pipeline_id: weather_api
-extractor_class: WeatherExtractor
+pipeline_id: example_pipeline
+extractor:
+  class: DataExtractor
+  batch_size: 100
+  max_concurrent: 10
+
 output:
-  - type: bigquery
-    config:
-      dataset_id: raw_data
-      table_id: weather
-  - type: gcs
-    enabled: true
-    config:
-      bucket: data-lake
+  type: json
+  config:
+    format: jsonl
+    partition_by: date
 ```
 
-## Security
+### Common Patterns
 
-1. **Authentication**
-   - OAuth 2.0 support
-   - Automatic token refresh
-   - Secure credential storage
-   - Environment isolation
-
-2. **Secret Management**
-   - Google Cloud Secret Manager
-   - Environment-specific secrets
-   - Credential rotation
-   - Access control
-
-3. **Access Control**
-   - IAM integration
-   - Service accounts
-   - Minimal permissions
-   - Audit logging
-
-## Monitoring and Observability
-
-1. **Metrics**
-   - Pipeline success rates
-   - Data volume metrics
-   - Processing latency
-   - Resource utilization
-
-2. **Logging**
-   - Structured logging
-   - Error tracking
-   - Audit trails
-   - Performance monitoring
-
-3. **Alerting**
-   - Pipeline failures
-   - Rate limit warnings
-   - Resource exhaustion
-   - Data quality issues
-
-## Future Enhancements
-
-1. **Planned Features**
-   - Schema evolution handling
-   - Real-time processing
-   - Data quality checks
-   - Advanced monitoring
-
-2. **Scalability Improvements**
-   - Distributed processing
-   - Dynamic scaling
-   - Cache optimization
-   - Performance tuning
-
-3. **Integration Options**
-   - Additional data sources
-   - New output formats
-   - Workflow integration
-   - API gateway support
-
-## Batch Processing and Data Flow
-
-### Batch Processing Architecture
-
-```mermaid
-sequenceDiagram
-    participant API as API Source
-    participant Extractor
-    participant Pipeline
-    participant Output
-    participant Storage as Storage (GCS/BQ)
-
-    Note over Extractor: Batch Size: 100 (default)
-    loop API Batches
-        Extractor->>API: Fetch Batch
-        API-->>Extractor: Return Data
-        Extractor->>Extractor: Transform Data
-    end
-    Extractor->>Pipeline: Complete Dataset
-    Note over Pipeline: Combines All Batches
-    Pipeline->>Output: Full Dataset
-    Note over Output: Batch Size: 1000 (default)
-    loop Output Batches
-        Output->>Storage: Write Batch
-    end
+1. **Incremental Processing**
+```yaml
+watermark:
+  enabled: true
+  field: timestamp
+  window_size: 1h
 ```
 
-### Multi-Level Batching
+2. **Error Recovery**
+```yaml
+error_handling:
+  mode: continue
+  max_retries: 3
+  backoff: exponential
+```
 
-1. **Extractor Level Batching**
-   - Default batch size: 100 records
-   - Purpose: Optimize API calls and memory usage
-   - Process:
-     ```python
-     async def extract(self):
-         all_data = []
-         for batch in batches:
-             batch_data = await self._process_batch(batch)
-             all_data.extend(batch_data)
-         return all_data  # Complete dataset
-     ```
+## V. Technical Details
+
+### Batch Processing
+
+1. **Extractor Level**
+```python
+async def extract(self, parameters: Dict[str, Any]) -> List[Dict[str, Any]]:
+    batches = self._create_batches(parameters)
+    results = []
+    
+    for batch in batches:
+        batch_data = await self._process_batch(batch)
+        results.extend(batch_data)
+    
+    return results
+```
 
 2. **Pipeline Level**
-   - Acts as a data aggregator
-   - Collects all extractor batches
-   - Passes complete dataset to outputs
-   - No batching at this level
-
-3. **Output Level Batching**
-   - Default batch size: 1000 records (GCS example)
-   - Purpose: Optimize storage writes
-   - Process:
-     ```python
-     async def write(self, data):
-         for record in data:
-             current_batch.append(record)
-             if len(current_batch) >= batch_size:
-                 await self._write_batch()
-     ```
-
-### Example Data Flow
-
-For a dataset of 2500 records:
-
-1. **Extraction Phase**
-   - 25 API batches of 100 records each
-   - Each batch processed concurrently (up to max_concurrent_requests)
-   - All batches combined into single dataset
-
-2. **Pipeline Phase**
-   - Receives complete dataset (2500 records)
-   - Passes to configured outputs
-
-3. **Output Phase (GCS Example)**
-   - Breaks 2500 records into output batches
-   - Creates 3 files:
-     - File 1: 1000 records
-     - File 2: 1000 records
-     - File 3: 500 records
-
-### Batch Configuration
-
-```yaml
-api_config:
-  # Extractor batch settings
-  batch_size: 100
-  max_concurrent_requests: 10
-  rate_limit: 60
-
-output:
-  - type: "gcs"
-    config:
-      # Output batch settings
-      batch_size: 1000
-      file_format: "jsonl"
+```python
+async def execute_pipeline(self, pipeline_id: str, parameters: Dict[str, Any]) -> None:
+    pipeline = self.get_pipeline(pipeline_id)
+    data = await pipeline.extract(parameters)
+    await self.write_output(pipeline_id, data)
 ```
 
-### Benefits of Multi-Level Batching
-
-1. **Performance Optimization**
-   - Efficient API data fetching
-   - Controlled memory usage
-   - Optimized storage writes
-
-2. **Resource Management**
-   - Rate limiting at API level
-   - Controlled concurrent requests
-   - Efficient file management
-
-3. **Reliability**
-   - Independent batch error handling
-   - Partial success capability
-   - Clear error tracking per batch 
-
-## Parallel Processing and Window Management
-
-### Window-Based Processing Architecture
-
-```mermaid
-graph TD
-    A[Time Range] --> B[Window Manager]
-    B --> C1[Window 1]
-    B --> C2[Window 2]
-    B --> C3[Window 3]
-    C1 --> D[Parallel Processor]
-    C2 --> D
-    C3 --> D
-    D --> E1[Batch 1]
-    D --> E2[Batch 2]
-    D --> E3[Batch 3]
-    E1 --> F[Output Manager]
-    E2 --> F
-    E3 --> F
+3. **Output Level**
+```python
+async def write(self, data: List[Dict[str, Any]]) -> None:
+    for batch in self._batch_data(data, self.batch_size):
+        await self._write_batch(batch)
 ```
 
-### Window Processing Strategy
+### Streaming Implementation
 
-1. **Time Window Division**
-   - Large time ranges split into fixed windows
-   - Default window size: 24 hours
-   - Configurable via `window_size` parameter
-   ```python
-   window_config = WindowConfig(
-       window_type=WindowType.FIXED,
-       window_size="24h",
-       window_offset="0m"
-   )
-   ```
+1. **Extractor Streaming**
+```python
+async def extract_stream(self, parameters: Dict[str, Any]) -> AsyncIterator[Dict[str, Any]]:
+    async for item in self._fetch_data(parameters):
+        transformed = await self._transform_item(item)
+        yield transformed
+```
 
-2. **Parallel Window Processing**
-   - Concurrent processing of multiple windows
-   - Controlled by `max_concurrent_requests`
-   - Semaphore-based concurrency control
-   ```python
-   async def _process_windows(self, windows):
-       semaphore = asyncio.Semaphore(self.config.max_concurrent_requests)
-       async with semaphore:
-           return await asyncio.gather(*[self._process_window(w) for w in windows])
-   ```
+2. **Pipeline Streaming**
+```python
+async def execute_stream(self, pipeline_id: str, parameters: Dict[str, Any]) -> None:
+    pipeline = self.get_pipeline(pipeline_id)
+    async for item in pipeline.extract_stream(parameters):
+        await self.write_output(pipeline_id, [item])
+```
 
-3. **Window-Level Watermarking**
-   - Track progress per window
-   - Prevent duplicate processing
-   - Enable incremental updates
-   ```python
-   async def _update_window_watermark(self, window_end):
-       self._watermark_store[self._get_watermark_key()] = window_end
-   ```
+### Chain Execution
 
-### Enhanced Batch Processing
+1. **Single Chain**
+```python
+async def execute_single_chain(self, config: ChainConfig, parameters: Dict[str, Any]) -> Dict[str, Any]:
+    state = {}
+    
+    for step in config.extractors:
+        input_data = self._map_input(state, step.input_mapping)
+        result = await self._execute_step(step, input_data)
+        self._update_state(state, step.output_mapping, result)
+    
+    return state
+```
+
+2. **Parallel Chains**
+```python
+async def execute_parallel_chains(
+    self,
+    config: ChainConfig,
+    parameters_list: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    semaphore = asyncio.Semaphore(config.max_parallel_chains)
+    
+    async def execute_with_semaphore(params):
+        async with semaphore:
+            return await self.execute_single_chain(config, params)
+    
+    return await asyncio.gather(*[
+        execute_with_semaphore(params)
+        for params in parameters_list
+    ])
+```
+
+## VI. Operations
+
+### Monitoring
+- Pipeline success rates
+- Processing latency
+- Resource utilization
+- Error rates
+
+### Security
+- OAuth 2.0 and API key support
+- Secure credential management
+- Access control integration
+
+### Performance
+- Batch size tuning
+- Concurrency settings
+- Memory management
+- Caching strategies
+
+## VII. Core Framework Features
+
+### Parallel Processing
+
+1. **Configurable Strategies**
+```python
+class ParallelConfig:
+    strategy: ParallelProcessingStrategy  # TIME_WINDOWS, KNOWN_PAGES, CALCULATED_OFFSETS
+    max_concurrent: int
+    batch_size: Optional[int]
+    error_handling: ErrorHandlingMode
+```
+
+2. **Implementation Patterns**
+```python
+# Time-based parallel processing
+async def _process_time_windows(self, parameters: Dict[str, Any]) -> List[Dict[str, Any]]:
+    windows = self._calculate_time_windows(
+        start_time=parameters['start_time'],
+        end_time=parameters['end_time'],
+        window_size=self.config.window_size
+    )
+    
+    async def process_window(window):
+        window_params = {
+            **parameters,
+            'start_time': window.start,
+            'end_time': window.end
+        }
+        return await self._process_window(window_params)
+    
+    return await asyncio.gather(*[
+        process_window(window) for window in windows
+    ])
+
+# Offset-based parallel processing
+async def _process_calculated_offsets(self, parameters: Dict[str, Any]) -> List[Dict[str, Any]]:
+    total_items = await self._get_total_count(parameters)
+    chunks = self._calculate_chunks(total_items, self.config.chunk_size)
+    
+    async def process_chunk(start: int, end: int):
+        chunk_params = {
+            **parameters,
+            'offset': start,
+            'limit': end - start
+        }
+        return await self._process_chunk(chunk_params)
+    
+    return await asyncio.gather(*[
+        process_chunk(start, end) for start, end in chunks
+    ])
+```
+
+### Batching System
 
 1. **Multi-Level Batching**
-   - API-level batching (configurable size)
-   - Window-level batching (time-based)
-   - Output-level batching (storage optimization)
+```python
+# API-level batching
+class BatchConfig:
+    batch_size: int = 100
+    max_concurrent_batches: int = 10
+    retry_failed_batches: bool = True
 
-2. **Batch Size Optimization**
-   ```python
-   # Extractor level
-   batch_size = min(
-       self.config.batch_size,
-       self.config.rate_limit // self.config.max_concurrent_requests
-   )
-   
-   # Output level
-   output_batch_size = min(
-       self.config.output_batch_size,
-       available_memory // estimated_record_size
-   )
-   ```
+# Output-level batching
+class OutputBatchConfig:
+    batch_size: int = 1000
+    flush_interval: int = 60  # seconds
+    max_batch_bytes: int = 5_000_000  # 5MB
+```
 
-3. **Memory Management**
-   - Controlled batch loading
-   - Immediate batch processing
-   - Efficient resource cleanup
-   ```python
-   async def _process_batch(self, batch):
-       try:
-           result = await self._transform_batch(batch)
-           await self._write_batch(result)
-       finally:
-           # Clean up batch resources
-           del batch
-   ```
+2. **Batch Processing Flow**
+```python
+async def _process_batch(self, items: List[Any]) -> List[Dict[str, Any]]:
+    # Pre-process batch
+    batch_params = self._prepare_batch_parameters(items)
+    
+    # Execute with retry
+    async with self._batch_semaphore:
+        try:
+            response = await self._execute_with_retry(
+                self._make_batch_request,
+                batch_params
+            )
+            return self._transform_batch_response(response)
+        except Exception as e:
+            self._handle_batch_error(e, items)
+            return []
+```
 
-### Performance Monitoring
+### Windowing
 
-1. **Window Metrics**
-   ```python
-   window_metrics = {
-       'window_start': window.start_time,
-       'window_end': window.end_time,
-       'processing_time': processing_duration,
-       'records_processed': record_count,
-       'batch_count': batch_count
-   }
-   ```
+1. **Window Types**
+```python
+class WindowType(str, Enum):
+    FIXED = "fixed"          # Fixed-size windows
+    SLIDING = "sliding"      # Overlapping windows
+    SESSION = "session"      # Dynamic session-based
+    GLOBAL = "global"        # Single window for all data
+```
 
-2. **Batch Performance**
-   ```python
-   batch_metrics = {
-       'batch_size': len(batch),
-       'processing_time': batch_duration,
-       'memory_usage': current_memory,
-       'success_rate': successful_records / total_records
-   }
-   ```
+2. **Window Configuration**
+```python
+class WindowConfig:
+    window_type: WindowType
+    window_size: str = "24h"        # e.g., "1h", "30m"
+    window_offset: str = "0m"       # Window start offset
+    window_overlap: str = "0m"      # For sliding windows
+    session_gap: str = "30m"        # For session windows
+    timestamp_field: str            # Field to window on
+```
 
-3. **Resource Utilization**
-   - Memory usage per batch
-   - Processing time per window
-   - Concurrent operations count
-   - I/O operations monitoring
+3. **Window Processing**
+```python
+def _calculate_windows(
+    self,
+    start_time: datetime,
+    end_time: datetime,
+    config: WindowConfig
+) -> List[TimeWindow]:
+    if config.window_type == WindowType.FIXED:
+        return self._calculate_fixed_windows(start_time, end_time, config)
+    elif config.window_type == WindowType.SLIDING:
+        return self._calculate_sliding_windows(start_time, end_time, config)
+    elif config.window_type == WindowType.SESSION:
+        return self._calculate_session_windows(self.data, config)
+    else:
+        return [TimeWindow(start_time, end_time)]
+```
 
-### Error Handling and Recovery
+### Watermarking
 
-1. **Window-Level Recovery**
-   ```python
-   async def _process_window_with_retry(self, window):
-       for attempt in range(max_retries):
-           try:
-               return await self._process_window(window)
-           except Exception as e:
-               if attempt == max_retries - 1:
-                   raise
-               await asyncio.sleep(retry_delay)
-   ```
+1. **Watermark Configuration**
+```python
+class WatermarkConfig:
+    enabled: bool = True
+    timestamp_field: str
+    max_lateness: str = "1h"
+    watermark_interval: str = "5m"
+    allowed_lateness: str = "30m"
+```
 
-2. **Batch-Level Error Handling**
-   ```python
-   async def _process_batch_safe(self, batch):
-       try:
-           return await self._process_batch(batch)
-       except Exception as e:
-           logger.error(f"Batch processing failed: {str(e)}")
-           self._metrics['failed_batches'] += 1
-           return []
-   ```
+2. **Watermark Tracking**
+```python
+class WatermarkTracker:
+    def __init__(self, config: WatermarkConfig):
+        self.config = config
+        self._watermarks: Dict[str, datetime] = {}
+    
+    async def update_watermark(self, key: str, event_time: datetime) -> None:
+        current = self._watermarks.get(key, datetime.min)
+        self._watermarks[key] = max(current, event_time)
+    
+    def get_watermark(self, key: str) -> datetime:
+        return self._watermarks.get(key, datetime.min)
+    
+    def is_late(self, event_time: datetime, key: str) -> bool:
+        watermark = self.get_watermark(key)
+        max_lateness = parse_duration(self.config.max_lateness)
+        return event_time < watermark - max_lateness
+```
 
-3. **Partial Success Handling**
-   - Track failed records
-   - Continue processing valid records
-   - Report detailed error metrics 
+### Pagination
+
+1. **Pagination Strategies**
+```python
+class PaginationType(str, Enum):
+    PAGE_NUMBER = "page_number"  # ?page=1&per_page=100
+    CURSOR = "cursor"           # ?cursor=abc123
+    OFFSET = "offset"           # ?offset=100&limit=50
+    LINK = "link"              # Link header based
+```
+
+2. **Strategy Implementation**
+```python
+class LinkHeaderStrategy(PaginationStrategy):
+    async def get_next_page_params(
+        self,
+        current_params: Dict[str, Any],
+        response: Dict[str, Any],
+        page_number: int
+    ) -> Optional[Dict[str, Any]]:
+        links = response.get('headers', {}).get('Link', '')
+        for link in links.split(','):
+            if 'rel="next"' in link:
+                url = link.split(';')[0].strip()[1:-1]
+                return self._parse_url_params(url)
+        return None
+
+class CursorStrategy(PaginationStrategy):
+    async def get_next_page_params(
+        self,
+        current_params: Dict[str, Any],
+        response: Dict[str, Any],
+        page_number: int
+    ) -> Optional[Dict[str, Any]]:
+        next_cursor = response.get(self.config.cursor_field)
+        if next_cursor:
+            return {
+                **current_params,
+                self.config.cursor_param: next_cursor
+            }
+        return None
+```
+
+3. **Pagination Flow**
+```python
+async def _paginated_request(
+    self,
+    endpoint: str,
+    params: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    strategy = self.config.pagination.strategy
+    all_items = []
+    page_params = strategy.get_initial_params(params)
+    
+    while True:
+        response = await self._make_request(endpoint, page_params)
+        items = self._extract_items(response)
+        all_items.extend(items)
+        
+        next_params = await strategy.get_next_page_params(
+            page_params, response, len(all_items)
+        )
+        if not next_params:
+            break
+            
+        page_params = next_params
+    
+    return all_items
+```
+
+### Rate Limiting
+
+1. **Rate Limit Configuration**
+```python
+class RateLimitConfig:
+    requests_per_second: int
+    max_concurrent: int
+    window_size: int = 1
+    fair_sharing: bool = True
+```
+
+2. **Rate Limiter Implementation**
+```python
+class RateLimiter:
+    def __init__(self, config: RateLimitConfig):
+        self.config = config
+        self._semaphore = asyncio.Semaphore(config.max_concurrent)
+        self._window_start = time.monotonic()
+        self._request_count = 0
+    
+    async def acquire(self):
+        async with self._semaphore:
+            await self._wait_for_rate_limit()
+            self._request_count += 1
+    
+    async def _wait_for_rate_limit(self):
+        current_time = time.monotonic()
+        window_elapsed = current_time - self._window_start
+        
+        if window_elapsed >= self.config.window_size:
+            self._window_start = current_time
+            self._request_count = 0
+        elif self._request_count >= self.config.requests_per_second:
+            sleep_time = self.config.window_size - window_elapsed
+            await asyncio.sleep(sleep_time)
+            self._window_start = time.monotonic()
+            self._request_count = 0
+```
+
+These core features work together to provide a robust and flexible framework for API data extraction:
+
+- **Parallel Processing** enables efficient handling of large datasets
+- **Batching** optimizes resource usage and API calls
+- **Windowing** supports time-based data processing
+- **Watermarking** ensures data completeness and handles late arrivals
+- **Pagination** handles large result sets efficiently
+- **Rate Limiting** prevents API throttling and ensures fair resource usage 
+
+## VIII. Core Design Principles
+
+### 1. Separation of Concerns
+
+The framework is built on clear separation of responsibilities:
+
+```python
+# Each component has a single, well-defined responsibility
+class BaseExtractor(ABC):
+    """Handles data extraction from API sources."""
+    @abstractmethod
+    async def extract(self, parameters: Dict[str, Any]) -> List[Dict[str, Any]]: ...
+
+class BaseOutput(ABC):
+    """Handles writing data to destinations."""
+    @abstractmethod
+    async def write(self, data: List[Dict[str, Any]]) -> None: ...
+
+class PipelineManager:
+    """Coordinates extractor and output interactions."""
+    async def execute_pipeline(self, pipeline_id: str, parameters: Dict[str, Any]) -> None: ...
+```
+
+### 2. Composition Over Inheritance
+
+The framework favors composition to build complex functionality:
+
+```python
+class GitHubExtractor(BaseExtractor):
+    def __init__(self, config: ExtractorConfig):
+        self.auth_handler = create_auth_handler(config.auth_config)
+        self.retry_handler = RetryHandler(config.retry)
+        self.watermark_handler = WatermarkHandler(config.watermark)
+        self.rate_limiter = RateLimiter(config.rate_limit)
+```
+
+### 3. Strategy Pattern for Flexibility
+
+Different strategies can be plugged in without changing core logic:
+
+```python
+# Pagination strategies
+class PaginationStrategy(ABC):
+    @abstractmethod
+    async def get_next_page_params(self, current_params, response, page_number): ...
+
+class LinkHeaderStrategy(PaginationStrategy):
+    async def get_next_page_params(self, current_params, response, page_number):
+        # Link header specific implementation
+        ...
+
+class CursorStrategy(PaginationStrategy):
+    async def get_next_page_params(self, current_params, response, page_number):
+        # Cursor based implementation
+        ...
+```
+
+### 4. Configuration as Code
+
+All behaviors are configurable through type-safe configuration objects:
+
+```python
+@dataclass
+class ExtractorConfig:
+    # Base configuration
+    base_url: str
+    endpoints: Dict[str, str]
+    
+    # Optional features
+    pagination: Optional[PaginationConfig] = None
+    watermark: Optional[WatermarkConfig] = None
+    retry: Optional[RetryConfig] = None
+    rate_limit: Optional[RateLimitConfig] = None
+```
+
+### 5. Resource Management
+
+Careful handling of system resources:
+
+```python
+class ResourceManager:
+    def __init__(self, config: ResourceConfig):
+        self._semaphore = asyncio.Semaphore(config.max_concurrent)
+        self._memory_limit = config.memory_limit
+        self._cleanup_interval = config.cleanup_interval
+
+    async def __aenter__(self):
+        await self._acquire_resources()
+        return self
+
+    async def __aexit__(self, *args):
+        await self._release_resources()
+```
+
+### 6. Error Handling and Recovery
+
+Comprehensive error handling at all levels:
+
+```python
+class ErrorHandler:
+    async def handle_error(self, error: Exception, context: Dict[str, Any]) -> None:
+        # 1. Log error with context
+        logger.error(f"Error in {context['component']}: {str(error)}")
+        
+        # 2. Update metrics
+        self._metrics[error.__class__.__name__] += 1
+        
+        # 3. Execute recovery strategy
+        if self._can_retry(error):
+            await self._retry_operation(context)
+        else:
+            await self._handle_permanent_failure(context)
+```
+
+### 7. Extensibility
+
+Easy to extend with new components:
+
+```python
+# 1. Define new extractor
+class CustomAPIExtractor(BaseExtractor):
+    async def extract(self, parameters: Dict[str, Any]) -> List[Dict[str, Any]]:
+        # Custom implementation
+        ...
+
+# 2. Define new output
+class CustomOutput(BaseOutput):
+    async def write(self, data: List[Dict[str, Any]]) -> None:
+        # Custom implementation
+        ...
+
+# 3. Register with factory
+ExtractorFactory.register("custom_api", CustomAPIExtractor)
+OutputFactory.register("custom_output", CustomOutput)
+```
+
+### 8. Observability
+
+Built-in monitoring and debugging capabilities:
+
+```python
+class Metrics:
+    def __init__(self):
+        self.counters = defaultdict(int)
+        self.gauges = defaultdict(float)
+        self.histograms = defaultdict(list)
+
+    def track_operation(self, operation: str, duration: float):
+        self.counters[f"{operation}_count"] += 1
+        self.histograms[f"{operation}_duration"].append(duration)
+```
+
+### 9. Asynchronous by Design
+
+Async/await for efficient I/O operations:
+
+```python
+class AsyncPipeline:
+    async def execute(self, parameters: Dict[str, Any]) -> None:
+        async with AsyncResourceManager() as resources:
+            # 1. Parallel data extraction
+            data = await asyncio.gather(*[
+                self._extract_chunk(chunk) 
+                for chunk in self._create_chunks(parameters)
+            ])
+            
+            # 2. Concurrent processing
+            processed = await asyncio.gather(*[
+                self._process_item(item) 
+                for item in data
+            ])
+            
+            # 3. Batched output
+            await self._write_batches(processed)
+```
+
+### 10. Immutable State
+
+State changes are explicit and traceable:
+
+```python
+@dataclass(frozen=True)
+class PipelineState:
+    id: str
+    status: Status
+    parameters: Dict[str, Any]
+    results: List[Dict[str, Any]]
+    errors: List[Dict[str, Any]]
+
+class StateManager:
+    def update_state(self, current_state: PipelineState, updates: Dict[str, Any]) -> PipelineState:
+        return PipelineState(
+            id=current_state.id,
+            status=updates.get('status', current_state.status),
+            parameters=updates.get('parameters', current_state.parameters),
+            results=updates.get('results', current_state.results),
+            errors=updates.get('errors', current_state.errors)
+        )
+```
+
+These design principles ensure the framework is:
+- **Maintainable**: Clear separation of concerns and modular design
+- **Extensible**: Easy to add new components and features
+- **Reliable**: Comprehensive error handling and resource management
+- **Observable**: Built-in monitoring and debugging
+- **Performant**: Efficient async operations and resource utilization
+- **Type-Safe**: Configuration as code with validation
+- **Flexible**: Pluggable strategies for different requirements 
