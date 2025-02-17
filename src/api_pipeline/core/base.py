@@ -364,9 +364,17 @@ class BaseExtractor(ABC):
         if isinstance(response, list):
             return response
 
-        items_field = self.config.pagination.items_field
-        items = response.get(items_field, response)
-        return items if isinstance(items, list) else [items]
+        # For dict responses, check if it's a paginated response with headers
+        if isinstance(response, dict):
+            # If response has 'data' field (our wrapper), use that
+            if 'data' in response:
+                items = response['data']
+            # Otherwise use the response itself (excluding headers)
+            else:
+                items = {k: v for k, v in response.items() if k != 'headers'}
+            return items if isinstance(items, list) else [items]
+
+        return [response]
 
     def _get_next_token(self, response: Dict[str, Any], pagination: PaginationConfig) -> Optional[str]:
         """Get next token based on pagination strategy."""
@@ -530,7 +538,7 @@ class BaseExtractor(ABC):
                     )
                     
                     # Process items in window
-                    items = self._get_items_to_process(window_params)
+                    items = await self._get_items_to_process(window_params)
                     if not items:
                         continue
                     
@@ -555,7 +563,7 @@ class BaseExtractor(ABC):
                 
             else:
                 # Non-watermark based extraction
-                items = self._get_items_to_process(parameters)
+                items = await self._get_items_to_process(parameters)
                 if not items:
                     logger.warning("No items to process")
                     return []
@@ -578,7 +586,7 @@ class BaseExtractor(ABC):
                 await self.session.close()
                 self.session = None
 
-    def _get_items_to_process(self, parameters: Dict[str, Any]) -> List[Any]:
+    async def _get_items_to_process(self, parameters: Dict[str, Any]) -> List[Any]:
         """Get items to process based on the configured processing pattern.
         
         For BATCH pattern:
@@ -636,6 +644,11 @@ class BaseExtractor(ABC):
         except KeyError as e:
             raise ValueError(f"Missing required URL parameter: {e}")
             
+        # If the path is already a full URL, return it as is
+        if path.startswith("http://") or path.startswith("https://"):
+            return path
+            
+        # Otherwise, append it to the base URL
         return f"{self.config.base_url}{path}"
 
     async def _make_request(
@@ -644,17 +657,27 @@ class BaseExtractor(ABC):
         params: Optional[Dict[str, Any]] = None,
         endpoint_override: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Make a single request with retries and rate limiting."""
-        params = params or {}
-        url = self._get_url(endpoint, params, endpoint_override)
-        request_id = f"{endpoint}:{hash(str(params))}"
+        """Make HTTP request with retry logic."""
+        await self._ensure_session()
         
         async def do_request():
-            async with self.session.get(url, params=params) as response:
+            url = self._get_url(endpoint, params or {}, endpoint_override)
+            async with self.session.get(url) as response:
                 response.raise_for_status()
-                return await response.json()
+                data = await response.json()
+                # Include headers in the response for pagination
+                if isinstance(data, dict):
+                    data['headers'] = dict(response.headers)
+                    return data
+                return {
+                    'data': data,
+                    'headers': dict(response.headers)
+                }
         
-        return await self.retry_handler.execute_with_retry(request_id, do_request)
+        # Create retry handler for this request
+        retry_handler = RetryHandler(self.config.retry)
+        request_id = f"{endpoint}:{hash(str(params))}"
+        return await retry_handler.execute_with_retry(request_id, do_request)
 
     def _get_endpoint_override(self, parameters: Dict[str, Any]) -> Optional[str]:
         """Get the endpoint override for the API request.
@@ -952,6 +975,99 @@ class BaseExtractor(ABC):
                 break
                 
         return all_results
+
+    async def extract_stream(self, parameters: Optional[Dict[str, Any]] = None) -> AsyncIterator[Dict[str, Any]]:
+        """Stream data with built-in batching and watermark support."""
+        try:
+            parameters = parameters or {}
+            
+            if self.config.watermark and self.config.watermark.enabled:
+                start_time = await self.watermark_handler.get_last_watermark()
+                if not start_time:
+                    start_time = (
+                        self.config.watermark.initial_watermark or 
+                        datetime.now(UTC) - timedelta(
+                            seconds=self.config.watermark.lookback_seconds
+                        )
+                    )
+                
+                windows = self._get_window_bounds(start_time)
+                logger.info(f"Processing {len(windows)} windows from {start_time}")
+                
+                max_watermark = start_time
+                
+                for window_start, window_end in windows:
+                    self._metrics['window_count'] += 1
+                    logger.info(f"Processing window: {window_start} to {window_end}")
+                    
+                    window_params = self.watermark_handler.apply_watermark_filters(
+                        parameters, window_start, window_end
+                    )
+                    
+                    items = await self._get_items_to_process(window_params)
+                    if not items:
+                        continue
+                    
+                    for i in range(0, len(items), self.config.batch_size):
+                        batch = items[i:i + self.config.batch_size]
+                        async for item in self._process_batch_stream(batch, window_params):
+                            # Update watermark as we process
+                            item_timestamp = datetime.fromisoformat(
+                                str(item[self.config.watermark.timestamp_field])
+                            )
+                            max_watermark = max(max_watermark, item_timestamp)
+                            yield item
+                            
+                            # Update watermark periodically
+                            if max_watermark > start_time:
+                                await self.watermark_handler.update_watermark(max_watermark)
+                
+            else:
+                items = await self._get_items_to_process(parameters)
+                if not items:
+                    logger.warning("No items to process")
+                    return
+                    
+                logger.info(f"Processing {len(items)} items in batches of {self.config.batch_size}")
+                
+                for i in range(0, len(items), self.config.batch_size):
+                    batch = items[i:i + self.config.batch_size]
+                    async for item in self._process_batch_stream(batch, parameters):
+                        yield item
+                        
+        finally:
+            if self.session:
+                await self.session.close()
+                self.session = None
+
+    async def _process_batch_stream(self, batch: List[Dict[str, Any]], window_params: Dict[str, Any]) -> AsyncIterator[Dict[str, Any]]:
+        """Process a batch of items in parallel and stream results."""
+        tasks = []
+        
+        async def process_item(item: Dict[str, Any]) -> Dict[str, Any]:
+            """Process a single item and return the result."""
+            try:
+                result = await self._transform_item(item)
+                self._metrics['items_processed'] += 1
+                return result
+            except Exception as e:
+                logger.error(f"Error processing item: {e}")
+                self._metrics['failed_batches'] += 1
+                raise
+        
+        # Create tasks for each item in the batch
+        for item in batch:
+            tasks.append(process_item(item))
+        
+        # Process tasks as they complete
+        for task in asyncio.as_completed(tasks):
+            try:
+                result = await task
+                if result:
+                    yield result
+            except Exception as e:
+                logger.error(f"Error in batch processing: {e}")
+                continue
 
 
 class OutputConfig(BaseModel):

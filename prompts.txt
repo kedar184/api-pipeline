@@ -11,7 +11,7 @@ Implement pagination support for handling large datasets
 Add parallel processing for the chained requests
 Add error handling and retry logic
 
-lets switch context back to api-pipeline project. 
+lets switch context back to api-pipeline from our previous hr project. 
 go through the codebase and explain me what is done so far and we will start progressing
 
 our yaml is going to grow big and will be a issue for managing changes. i think we should have a yaml definition per source. 
@@ -146,6 +146,11 @@ now lets tackle this method. take a simillar line of reasonining
 
 has all things together . do you think the pattern we have used for ParallelProcessingStrategy is better ?
 Using strategy pattern may keep the code clean and extensible.
+
+do not change base extractor implementation focus on chain..
+
+take a step back to reason.. tart small by deleting test steps if needed.. goal is to achieve the wider outcome and not get struck in a loop of errors
+
 
 ****** some doco prompts
 write a document on the system design and place it in docs folder

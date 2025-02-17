@@ -96,7 +96,8 @@ class GitHubUsersExtractor(BaseExtractor):
                 "created_at": parse_datetime(item["created_at"]),
                 "updated_at": parse_datetime(item["updated_at"]),
                 "url": item["html_url"],
-                "type": item["type"]
+                "type": item["type"],
+                "repos_url": item["repos_url"]
             }
         except KeyError as e:
             logger.error(f"Failed to transform user data: {str(e)}")

@@ -2,10 +2,11 @@ import os
 import json
 import asyncio
 from datetime import datetime, UTC
-from typing import Any, Dict, List
+from typing import Any, Dict, List, AsyncIterator
 from pathlib import Path
 from loguru import logger
 import time
+import aiofiles
 
 from api_pipeline.core.base import BaseOutput, OutputConfig
 
@@ -85,50 +86,25 @@ class LocalJsonOutput(BaseOutput):
         return self.output_dir / filename
 
     async def _write_batch(self, batch: List[Dict[str, Any]], partition_path: str) -> None:
-        """Write a batch of records to a file."""
+        """Write a batch of records to a partition."""
         if not batch:
             return
 
         try:
-            async with self._semaphore:  # Limit concurrent writes
-                batch_start_time = time.monotonic()
-                
-                # Get output file path
-                output_file = self._get_output_file(partition_path)
-                
-                # Write data based on format
-                if self.file_format == "jsonl":
-                    with open(output_file, "w") as f:
-                        for record in batch:
-                            line = json.dumps(record, cls=DateTimeEncoder) + "\n"
-                            f.write(line)
-                            self._metrics['bytes_written'] += len(line.encode())
-                else:  # regular json
-                    with open(output_file, "w") as f:
-                        json_data = json.dumps(batch, indent=2, cls=DateTimeEncoder)
-                        f.write(json_data)
-                        self._metrics['bytes_written'] += len(json_data.encode())
-                
-                # Update batch metrics
-                batch_size = len(batch)
-                self._metrics['batch_count'] += 1
-                self._metrics['total_batch_size'] += batch_size
-                self._metrics['max_batch_size'] = max(self._metrics['max_batch_size'], batch_size)
-                self._metrics['min_batch_size'] = min(
-                    self._metrics['min_batch_size'] if self._metrics['min_batch_size'] != float('inf') else batch_size,
-                    batch_size
-                )
-                
-                # Update timing metrics
-                write_time = time.monotonic() - batch_start_time
-                self._metrics['total_write_time'] += write_time
-                self._metrics['last_write_time'] = datetime.now(UTC)
-                
-                logger.info(f"Successfully wrote batch of {batch_size} records to {output_file}")
-                
+            # Get the output file path for this partition
+            output_file = self._get_output_file(partition_path)
+            
+            # Write the batch to the file
+            await self._write_to_file(batch, output_file)
+            
+            # Update metrics
+            self._metrics['batch_count'] += 1
+            self._metrics['total_batch_size'] += len(batch)
+            self._metrics['max_batch_size'] = max(self._metrics['max_batch_size'], len(batch))
+            self._metrics['min_batch_size'] = min(self._metrics['min_batch_size'], len(batch))
+            
         except Exception as e:
-            logger.error(f"Error writing batch to local JSON file: {str(e)}")
-            self._metrics['write_errors'] += 1
+            logger.error(f"Error writing batch to {partition_path}: {e}")
             self._metrics['failed_batches'] += 1
             raise
 
@@ -182,4 +158,101 @@ class LocalJsonOutput(BaseOutput):
 
     async def close(self) -> None:
         """Clean up resources."""
-        pass  # No cleanup needed for file operations 
+        pass  # No cleanup needed for file operations
+
+    async def write_stream(self, data_stream: AsyncIterator[Dict[str, Any]]) -> None:
+        """Write data from a stream to the output destination."""
+        batch = []
+        batch_size = self.config.config.get('batch_size', 100)
+        
+        async for item in data_stream:
+            batch.append(item)
+            if len(batch) >= batch_size:
+                await self._write_batch(batch)
+                batch = []
+        
+        # Write any remaining items
+        if batch:
+            await self._write_batch(batch)
+
+    async def _write_to_file(self, batch: List[Dict[str, Any]], output_file: Path) -> None:
+        """Write a batch of items to a file."""
+        try:
+            # Update batch metrics
+            batch_size = len(batch)
+            
+            # Write data based on format
+            if self.file_format == "jsonl":
+                async with aiofiles.open(output_file, "w") as f:
+                    for record in batch:
+                        line = json.dumps(record, cls=DateTimeEncoder) + "\n"
+                        await f.write(line)
+                        self._metrics['bytes_written'] += len(line.encode())
+            else:  # regular json
+                async with aiofiles.open(output_file, "w") as f:
+                    json_data = json.dumps(batch, indent=2, cls=DateTimeEncoder)
+                    await f.write(json_data)
+                    self._metrics['bytes_written'] += len(json_data.encode())
+            
+            # Update timing metrics
+            self._metrics['last_write_time'] = datetime.now(UTC)
+            logger.info(f"Successfully wrote batch of {batch_size} records to {output_file}")
+            
+        except Exception as e:
+            logger.error(f"Error writing to file {output_file}: {e}")
+            self._metrics['write_errors'] += 1
+            self._metrics['failed_batches'] += 1
+            raise
+
+    async def _write_to_partition(self, item: Dict[str, Any], partition_path: str) -> None:
+        """Write an item to a partition."""
+        try:
+            # Update batch metrics
+            batch_size = 1
+            self._metrics['batch_count'] += 1
+            self._metrics['total_batch_size'] += batch_size
+            self._metrics['max_batch_size'] = max(self._metrics['max_batch_size'], batch_size)
+            self._metrics['min_batch_size'] = min(self._metrics['min_batch_size'], batch_size)
+            
+            # Update record metrics
+            self._metrics['records_written'] += 1
+            self._metrics['last_write_time'] = datetime.now(UTC)
+            
+            # Write the item
+            output_file = self._get_output_file(partition_path)
+            with open(output_file, "a") as f:
+                line = json.dumps(item, cls=DateTimeEncoder) + "\n"
+                f.write(line)
+                self._metrics['bytes_written'] += len(line.encode())
+            
+        except Exception as e:
+            self._metrics['write_errors'] += 1
+            self._metrics['failed_batches'] += 1
+            raise
+
+    async def _write_to_partition(self, item: Dict[str, Any], partition_by: List[str]) -> None:
+        """Write an item to a partition."""
+        try:
+            # Update batch metrics
+            batch_size = 1
+            self._metrics['batch_count'] += 1
+            self._metrics['total_batch_size'] += batch_size
+            self._metrics['max_batch_size'] = max(self._metrics['max_batch_size'], batch_size)
+            self._metrics['min_batch_size'] = min(self._metrics['min_batch_size'], batch_size)
+            
+            # Update record metrics
+            self._metrics['records_written'] += 1
+            self._metrics['last_write_time'] = datetime.now(UTC)
+            
+            # Write the item
+            partition_path = self._get_partition_path(item)
+            output_file = self._get_output_file(partition_path)
+            with open(output_file, "a") as f:
+                line = json.dumps(item, cls=DateTimeEncoder) + "\n"
+                f.write(line)
+                self._metrics['bytes_written'] += len(line.encode())
+            
+        except Exception as e:
+            self._metrics['write_errors'] += 1
+            self._metrics['failed_batches'] += 1
+            raise 

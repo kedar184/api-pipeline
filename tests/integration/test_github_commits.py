@@ -21,9 +21,11 @@ from api_pipeline.core.base import (
 )
 from api_pipeline.core.auth import AuthConfig
 from pathlib import Path
+import pytest
 
-def test_config():
-    """Test GitHub commits extraction with parallel window and batch processing."""
+@pytest.mark.asyncio
+async def test_config():
+    """Test GitHub commits extraction with parallel window processing."""
     # Load environment variables from .env file
     dotenv_path = os.path.join(os.path.dirname(__file__), '../../.env')
     load_dotenv(dotenv_path)
@@ -43,7 +45,7 @@ def test_config():
             auth_type="bearer",
             auth_credentials={"token": github_token}
         ),
-        # Set SINGLE processing pattern as GitHub returns multiple commits per request
+        # Use SINGLE processing pattern
         processing_pattern=ProcessingPattern.SINGLE,
         
         # Optimize for parallel processing
@@ -62,11 +64,11 @@ def test_config():
         watermark=WatermarkConfig(
             enabled=True,
             timestamp_field="committed_at",
-            initial_watermark=datetime.now(UTC) - timedelta(days=30),  # Look back 30 days
+            initial_watermark=datetime.now(UTC) - timedelta(days=1),  # Look back 1 day
             window=WindowConfig(
                 window_type=WindowType.FIXED,
-                window_size="7d",  # 7-day windows
-                window_overlap="1d",  # 1-day overlap
+                window_size="12h",  # 12-hour windows
+                window_overlap="2h",  # 2-hour overlap
                 timestamp_field="committed_at"
             ),
             time_format="%Y-%m-%dT%H:%M:%SZ",
@@ -83,12 +85,20 @@ def test_config():
         )
     )
 
+    # Test single repo extraction
+    print("\nTesting commit extraction...")
+    await extract_and_validate(config)
+    
+    return config
+
+async def extract_and_validate(config: ExtractorConfig):
+    """Helper function to test extraction with a given configuration."""
     # Create output config optimized for parallel writes
     output_config = OutputConfig(
         type="local_json",
         enabled=True,
         config={
-            "output_dir": "./data/github/commits",
+            "output_dir": "./data/github/commits/single",
             "file_format": "jsonl",
             "partition_by": ["date", "repo"],
             "batch_size": 10,  # Small batch size for testing parallel writes
@@ -104,115 +114,40 @@ def test_config():
         # Record start time
         overall_start_time = time.time()
         
-        # Extract commits with parallel processing
-        commits = asyncio.run(extractor.extract(parameters={"repo": "apache/spark"}))
+        # Extract and write commits using streaming
+        commit_count = 0
+        first_commit = None
+        
+        async for commit in extractor.extract_stream(parameters={"repo": "pallets/flask"}):
+            if first_commit is None:
+                first_commit = commit
+            commit_count += 1
+            
+            # Write commits in real-time
+            await output_handler.write([commit])
         
         # Record end time
         overall_end_time = time.time()
         
-        # Write commits to output with parallel processing
-        asyncio.run(output_handler.write(commits))
-        
         # Get metrics from all components
         extractor_metrics = extractor.get_metrics()
         output_metrics = output_handler.get_metrics()
-        auth_metrics = extractor.auth_handler.get_metrics()
-        retry_metrics = extractor.retry_handler.get_metrics()
-        if hasattr(extractor, 'watermark_handler'):
-            watermark_metrics = extractor.watermark_handler.get_metrics()
         
-        # Print detailed metrics summary
-        print("\nDetailed Metrics Summary")
-        print("======================")
-        
-        print("\nExtractor Metrics")
-        print("----------------")
-        for key, value in sorted(extractor_metrics.items()):
-            if isinstance(value, (int, float)):
-                print(f"{key}: {value:.2f}" if isinstance(value, float) else f"{key}: {value}")
-            else:
-                print(f"{key}: {value}")
-        
-        print("\nOutput Metrics")
-        print("-------------")
-        for key, value in sorted(output_metrics.items()):
-            if isinstance(value, (int, float)):
-                print(f"{key}: {value:.2f}" if isinstance(value, float) else f"{key}: {value}")
-            else:
-                print(f"{key}: {value}")
-        
-        print("\nAuth Metrics")
-        print("------------")
-        for key, value in sorted(auth_metrics.items()):
-            if isinstance(value, (int, float)):
-                print(f"{key}: {value:.2f}" if isinstance(value, float) else f"{key}: {value}")
-            else:
-                print(f"{key}: {value}")
-        
-        print("\nRetry Metrics")
-        print("-------------")
-        for key, value in sorted(retry_metrics.items()):
-            if isinstance(value, (int, float)):
-                print(f"{key}: {value:.2f}" if isinstance(value, float) else f"{key}: {value}")
-            else:
-                print(f"{key}: {value}")
-        
-        if hasattr(extractor, 'watermark_handler'):
-            print("\nWatermark Metrics")
-            print("----------------")
-            for key, value in sorted(watermark_metrics.items()):
-                if isinstance(value, (int, float)):
-                    print(f"{key}: {value:.2f}" if isinstance(value, float) else f"{key}: {value}")
-                else:
-                    print(f"{key}: {value}")
-        
-        print("\nParallel Processing Summary")
-        print("=========================")
-        print(f"Time Windows: {extractor_metrics['window_count']}")
-        print(f"Window Size: 7 days with 1 day overlap")
-        print(f"Extraction Batches: {extractor_metrics['batch_count']}")
-        print(f"Extraction Batch Size: {config.batch_size}")
-        print(f"Concurrent Requests: {config.max_concurrent_requests}")
-        print(f"Output Batches: {output_metrics['batch_count']}")
-        print(f"Output Batch Size: {output_config.config['batch_size']}")
-        print(f"Concurrent Writes: {output_config.config['max_concurrent_writes']}")
-        
-        print("\nExecution Summary")
-        print("================")
+        print("\nExtraction Results")
+        print("=================")
         print(f"Total Processing Time: {overall_end_time - overall_start_time:.2f} seconds")
         print(f"Items Processed: {extractor_metrics['items_processed']}")
-        print(f"Average Time per Window: {extractor_metrics['total_processing_time'] / extractor_metrics['window_count']:.2f} seconds")
+        print(f"Windows Processed: {extractor_metrics['window_count']}")
+        print(f"Number of Commits: {commit_count}")
         
-        if commits:
-            # Analyze timestamp distribution
-            timestamps = [commit['committed_at'] for commit in commits]
-            timestamps.sort()
-            
-            print("\nTimestamp Analysis")
-            print("==================")
-            print(f"Earliest Commit: {timestamps[0]}")
-            print(f"Latest Commit: {timestamps[-1]}")
-            print(f"Total Time Range: {timestamps[-1] - timestamps[0]}")
-            print(f"Number of Commits: {len(commits)}")
-            
-            # Analyze commits per day
-            from collections import defaultdict
-            commits_per_day = defaultdict(int)
-            for ts in timestamps:
-                commits_per_day[ts.date()] += 1
-            
-            print("\nCommits per Day")
-            print("===============")
-            for date, count in sorted(commits_per_day.items()):
-                print(f"{date}: {count} commits")
-        
-        print(f"\nCommits have been written to {output_config.config['output_dir']}")
+        if first_commit:
+            print(f"First Commit SHA: {first_commit['sha']}")
+            print(f"First Commit Date: {first_commit['committed_at']}")
+            print(f"First Commit Author: {first_commit['commit']['author']['name']}")
         
     finally:
         # Clean up
-        asyncio.run(output_handler.close())
-        
-    return config
+        await output_handler.close()
 
 async def main():
     """Run the GitHub commits extraction with performance tracking."""
@@ -247,7 +182,7 @@ async def main():
     )
 
     # Get the base config
-    config = test_config()
+    config = await test_config()
     
     # Update auth config with real token
     config.auth_config = auth_config
@@ -263,7 +198,7 @@ async def main():
         overall_start_time = time.time()
         
         # Extract commits
-        commits = await extractor.extract(parameters={"repo": "apache/spark"})
+        commits = await extractor.extract(parameters={"repo": "pallets/flask"})
         
         # Record end time
         overall_end_time = time.time()
