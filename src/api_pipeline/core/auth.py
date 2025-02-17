@@ -1,13 +1,22 @@
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, UTC
-from typing import Dict, Optional
+from typing import Dict, Optional, Union, ClassVar
 import aiohttp
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from loguru import logger
+
+class AuthType:
+    """Constants for supported authentication types."""
+    OAUTH = "oauth"
+    API_KEY = "api_key"
+    BEARER = "bearer"
+    BASIC = "basic"
 
 class AuthConfig(BaseModel):
     """Base authentication configuration."""
     auth_type: str
     auth_credentials: Dict[str, str]
+    headers_prefix: Optional[str] = None  # Custom prefix for auth headers (e.g., "Token" instead of "Bearer")
 
 class OAuthConfig(AuthConfig):
     """OAuth specific configuration."""
@@ -18,19 +27,40 @@ class OAuthConfig(AuthConfig):
     access_token: Optional[str] = None
     token_expiry: Optional[datetime] = None
     scope: Optional[str] = None
+    auto_refresh: bool = True  # Whether to automatically refresh expired tokens
+    refresh_margin: int = 300  # Seconds before expiry to trigger refresh
+
+class BasicAuthConfig(AuthConfig):
+    """Basic auth configuration."""
+    username: str
+    password: str
+    use_base64: bool = True  # Whether to base64 encode credentials
 
 class BaseAuth(ABC):
     """Base authentication handler."""
+    
+    def __init__(self):
+        self._metrics = {
+            'auth_attempts': 0,
+            'auth_failures': 0,
+            'last_auth_time': None,
+            'token_refreshes': 0
+        }
     
     @abstractmethod
     async def get_auth_headers(self) -> Dict[str, str]:
         """Get authentication headers for request."""
         pass
+    
+    def get_metrics(self) -> Dict[str, any]:
+        """Get authentication metrics."""
+        return self._metrics.copy()
 
 class OAuthHandler(BaseAuth):
     """OAuth authentication with refresh token support."""
     
     def __init__(self, config: OAuthConfig):
+        super().__init__()
         self.config = config
         self._session: Optional[aiohttp.ClientSession] = None
     
@@ -42,6 +72,7 @@ class OAuthHandler(BaseAuth):
     async def _refresh_token(self):
         """Refresh the access token using refresh token."""
         try:
+            self._metrics['auth_attempts'] += 1
             await self._ensure_session()
             
             data = {
@@ -53,6 +84,7 @@ class OAuthHandler(BaseAuth):
             if self.config.scope:
                 data["scope"] = self.config.scope
             
+            logger.info("Refreshing OAuth token...")
             async with self._session.post(self.config.token_url, data=data) as response:
                 response.raise_for_status()
                 token_data = await response.json()
@@ -65,8 +97,14 @@ class OAuthHandler(BaseAuth):
                 # Set token expiry (default to 1 hour if not provided)
                 expires_in = token_data.get("expires_in", 3600)
                 self.config.token_expiry = datetime.now(UTC) + timedelta(seconds=expires_in)
+                
+                self._metrics['token_refreshes'] += 1
+                self._metrics['last_auth_time'] = datetime.now(UTC)
+                logger.info("Successfully refreshed OAuth token")
         
         except Exception as e:
+            self._metrics['auth_failures'] += 1
+            logger.error(f"Failed to refresh OAuth token: {str(e)}")
             raise ValueError(f"Failed to refresh OAuth token: {str(e)}")
         
         finally:
@@ -74,12 +112,21 @@ class OAuthHandler(BaseAuth):
                 await self._session.close()
                 self._session = None
 
+    def _should_refresh(self) -> bool:
+        """Determine if token needs refresh based on expiry and margin."""
+        if not self.config.auto_refresh:
+            return False
+            
+        if not self.config.access_token or not self.config.token_expiry:
+            return True
+            
+        now = datetime.now(UTC)
+        refresh_time = self.config.token_expiry - timedelta(seconds=self.config.refresh_margin)
+        return now >= refresh_time
+
     async def get_auth_headers(self) -> Dict[str, str]:
         """Get OAuth headers, refreshing token if needed."""
-        # Check if token needs refresh
-        if (not self.config.access_token or 
-            not self.config.token_expiry or 
-            datetime.now(UTC) >= self.config.token_expiry):
+        if self._should_refresh():
             await self._refresh_token()
         
         return {
@@ -90,36 +137,83 @@ class ApiKeyAuth(BaseAuth):
     """API Key authentication."""
     
     def __init__(self, config: AuthConfig):
+        super().__init__()
         self.config = config
     
     async def get_auth_headers(self) -> Dict[str, str]:
         """Get API key headers."""
+        self._metrics['auth_attempts'] += 1
+        self._metrics['last_auth_time'] = datetime.now(UTC)
+        
+        prefix = self.config.headers_prefix or "ApiKey"
         return {
-            "Authorization": f"ApiKey {self.config.auth_credentials['api_key']}"
+            "Authorization": f"{prefix} {self.config.auth_credentials['api_key']}"
         }
 
 class BearerAuth(BaseAuth):
     """Bearer token authentication."""
     
     def __init__(self, config: AuthConfig):
+        super().__init__()
         self.config = config
     
     async def get_auth_headers(self) -> Dict[str, str]:
         """Get bearer token headers."""
+        self._metrics['auth_attempts'] += 1
+        self._metrics['last_auth_time'] = datetime.now(UTC)
+        
+        prefix = self.config.headers_prefix or "Bearer"
         return {
-            "Authorization": f"Bearer {self.config.auth_credentials['token']}"
+            "Authorization": f"{prefix} {self.config.auth_credentials['token']}"
         }
 
-def create_auth_handler(config: AuthConfig) -> BaseAuth:
-    """Factory function to create appropriate auth handler."""
+class BasicAuth(BaseAuth):
+    """Basic authentication."""
+    
+    def __init__(self, config: BasicAuthConfig):
+        super().__init__()
+        self.config = config
+    
+    async def get_auth_headers(self) -> Dict[str, str]:
+        """Get basic auth headers."""
+        self._metrics['auth_attempts'] += 1
+        self._metrics['last_auth_time'] = datetime.now(UTC)
+        
+        if self.config.use_base64:
+            import base64
+            credentials = f"{self.config.username}:{self.config.password}"
+            encoded = base64.b64encode(credentials.encode()).decode()
+            return {"Authorization": f"Basic {encoded}"}
+        
+        return {
+            "Authorization": f"Basic {self.config.username}:{self.config.password}"
+        }
+
+def create_auth_handler(config: Union[AuthConfig, OAuthConfig, BasicAuthConfig]) -> BaseAuth:
+    """Factory function to create appropriate auth handler.
+    
+    Args:
+        config: Authentication configuration
+        
+    Returns:
+        Appropriate authentication handler instance
+        
+    Raises:
+        ValueError: If auth type is not supported
+    """
     handlers = {
-        "oauth": OAuthHandler,
-        "api_key": ApiKeyAuth,
-        "bearer": BearerAuth
+        AuthType.OAUTH: OAuthHandler,
+        AuthType.API_KEY: ApiKeyAuth,
+        AuthType.BEARER: BearerAuth,
+        AuthType.BASIC: BasicAuth
     }
     
     handler_class = handlers.get(config.auth_type.lower())
     if not handler_class:
-        raise ValueError(f"Unsupported auth type: {config.auth_type}")
+        raise ValueError(
+            f"Unsupported auth type: {config.auth_type}. "
+            f"Supported types: {', '.join(handlers.keys())}"
+        )
     
+    logger.info(f"Creating auth handler for type: {config.auth_type}")
     return handler_class(config) 

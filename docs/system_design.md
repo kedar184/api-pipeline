@@ -26,6 +26,7 @@ The API Pipeline system is a scalable and extensible framework for extracting da
    - Creates pipeline instances
    - Manages component lifecycle
    - Handles configuration
+   - Provides component registration
 
 2. **Authentication System**
    - OAuth 2.0 with refresh tokens
@@ -38,18 +39,36 @@ The API Pipeline system is a scalable and extensible framework for extracting da
    - Concurrent processing
    - Rate limiting
    - Error handling
+   - Modular components:
+     - Retry handling
+     - Watermark tracking
+     - Pagination strategies
+     - Parallel processing
+     - Window management
 
 4. **Outputs**
    - BigQuery integration
    - GCS support
    - Local development output
    - Schema validation
+   - Modular output handlers
 
 5. **Pipeline Manager**
    - Orchestration
    - Status tracking
    - Error handling
    - Metrics collection
+   - Component coordination
+
+6. **Core Modules**
+   - `retry.py`: Retry mechanisms and configurations
+   - `watermark.py`: Watermark tracking and window management
+   - `pagination.py`: Pagination strategies and configurations
+   - `parallel.py`: Parallel processing configurations
+   - `windowing.py`: Time window calculations and management
+   - `output.py`: Output handling and configurations
+   - `auth.py`: Authentication handlers and configurations
+   - `base.py`: Core extractor and output base classes
 
 ## Core Components Class Diagram
 
@@ -68,7 +87,14 @@ classDiagram
     class BaseExtractor {
         <<abstract>>
         +ExtractorConfig config
+        +RetryHandler retry_handler
+        +WatermarkHandler watermark_handler
         +extract(parameters)*
+        +get_metrics()
+        +cleanup()
+        #_process_batch()
+        #_paginated_request()
+        #_transform_item()*
     }
 
     class BaseOutput {
@@ -76,6 +102,102 @@ classDiagram
         +OutputConfig config
         +write(data)*
         +close()*
+        +get_metrics()
+        +initialize()*
+    }
+
+    class RetryHandler {
+        +RetryConfig config
+        +RetryState state
+        +calculate_delay()
+        +should_retry()
+        +execute_with_retry()
+    }
+
+    class RetryState {
+        +Dict[str, Any] _state
+        +get_state()
+        +clear_state()
+        +clear_all()
+    }
+
+    class RetryConfig {
+        +int max_attempts
+        +int max_time
+        +float base_delay
+        +float max_delay
+        +bool jitter
+        +List[int] retry_on
+    }
+
+    class WatermarkHandler {
+        +WatermarkConfig config
+        +get_last_watermark()
+        +update_watermark()
+        +apply_watermark_filters()
+        +get_metrics()
+    }
+
+    class WatermarkConfig {
+        +bool enabled
+        +str timestamp_field
+        +str watermark_field
+        +WindowConfig window
+        +datetime initial_watermark
+        +str lookback_window
+        +str time_format
+    }
+
+    class WindowConfig {
+        +WindowType window_type
+        +str window_size
+        +str window_offset
+        +str window_overlap
+        +str timestamp_field
+        +window_size_seconds()
+        +window_offset_seconds()
+    }
+
+    class PaginationStrategy {
+        <<abstract>>
+        +get_next_page_params()*
+        +get_initial_params()*
+    }
+
+    class PaginationConfig {
+        +bool enabled
+        +PaginationStrategy strategy
+        +int page_size
+        +int max_pages
+        +with_page_numbers()$
+        +with_cursor()$
+        +with_offset()$
+        +with_link_header()$
+    }
+
+    class ParallelConfig {
+        <<interface>>
+    }
+
+    class TimeWindowParallelConfig {
+        +str window_size
+        +str window_overlap
+        +int max_concurrent_windows
+        +str timestamp_format
+        +window_size_seconds()
+        +window_overlap_seconds()
+    }
+
+    class KnownPagesParallelConfig {
+        +int max_concurrent_pages
+        +bool require_total_count
+        +int safe_page_size
+    }
+
+    class CalculatedOffsetParallelConfig {
+        +int max_concurrent_chunks
+        +int chunk_size
+        +bool require_total_count
     }
 
     class PipelineConfig {
@@ -102,44 +224,142 @@ classDiagram
         +create_pipeline()
     }
 
+    class ExtractorConfig {
+        +str base_url
+        +Dict endpoints
+        +AuthConfig auth_config
+        +ProcessingPattern pattern
+        +PaginationConfig pagination
+        +RetryConfig retry
+        +WatermarkConfig watermark
+        +ParallelConfig parallel_config
+    }
+
+    class AuthHandler {
+        <<abstract>>
+        +AuthConfig config
+        +get_auth_headers()*
+        +get_metrics()
+    }
+
+    class AuthConfig {
+        +str auth_type
+        +Dict auth_credentials
+        +str headers_prefix
+    }
+
+    class OAuthConfig {
+        +str token_url
+        +str client_id
+        +str client_secret
+        +str refresh_token
+        +str access_token
+        +datetime token_expiry
+        +bool auto_refresh
+    }
+
     PipelineManager --> PipelineConfig : manages
     PipelineManager --> PipelineRun : tracks
     PipelineManager --> PipelineFactory : uses
     PipelineFactory --> BaseExtractor : creates
     PipelineFactory --> BaseOutput : creates
+    BaseExtractor --> RetryHandler : uses
+    BaseExtractor --> WatermarkHandler : uses
+    BaseExtractor --> PaginationStrategy : uses
+    BaseExtractor --> AuthHandler : uses
+    BaseExtractor --> ExtractorConfig : configured by
     BaseExtractor <|-- WeatherExtractor : implements
     BaseExtractor <|-- GitHubExtractor : implements
     BaseOutput <|-- BigQueryOutput : implements
     BaseOutput <|-- GCSOutput : implements
-
+    RetryHandler --> RetryConfig : configured by
+    RetryHandler --> RetryState : manages
+    WatermarkHandler --> WatermarkConfig : configured by
+    WatermarkConfig --> WindowConfig : uses
+    PaginationStrategy <|-- PageNumberStrategy : implements
+    PaginationStrategy <|-- CursorStrategy : implements
+    PaginationStrategy <|-- LinkHeaderStrategy : implements
+    PaginationStrategy <|-- OffsetStrategy : implements
+    AuthHandler <|-- OAuthHandler : implements
+    AuthHandler <|-- BearerAuth : implements
+    AuthHandler <|-- ApiKeyAuth : implements
+    AuthHandler --> AuthConfig : configured by
+    OAuthHandler --> OAuthConfig : configured by
+    ParallelConfig <|-- TimeWindowParallelConfig : implements
+    ParallelConfig <|-- KnownPagesParallelConfig : implements
+    ParallelConfig <|-- CalculatedOffsetParallelConfig : implements
+    ExtractorConfig --> ParallelConfig : uses
+    ExtractorConfig --> PaginationConfig : uses
+    PaginationConfig --> PaginationStrategy : uses
 ```
 
 ## Core Components Interaction
 
 ### 1. Base Framework (`base.py`)
 - Provides abstract base classes `BaseExtractor` and `BaseOutput`
-- Defines configuration models `ExtractorConfig` and `OutputConfig`
-- Enables extensibility through abstract methods
-- Forms the foundation for all data source and output implementations
+- Defines core extraction and output interfaces
+- Coordinates component interactions
+- Manages component lifecycle
+- Delegates specialized functionality to dedicated modules
 
-### 2. Data Models (`models.py`)
-- Defines core data structures using Pydantic models
-- `PipelineConfig`: Configuration for pipeline setup
-- `PipelineRun`: Runtime execution state
-- `PipelineStatus`: Status reporting structure
+### 2. Retry System (`retry.py`)
+- Handles request retries with configurable strategies
+- Manages retry state and backoff calculations
+- Provides retry metrics and monitoring
+- Integrates with extractors for automatic retry handling
+
+### 3. Watermark System (`watermark.py`)
+- Tracks data processing progress
+- Manages incremental data extraction
+- Handles time-based windowing
+- Provides watermark metrics and monitoring
+
+### 4. Pagination System (`pagination.py`)
+- Implements various pagination strategies
+- Manages page state and continuation
+- Handles response parsing and validation
+- Supports dynamic strategy selection
+
+### 5. Parallel Processing (`parallel.py`)
+- Configures parallel execution strategies
+- Manages concurrent request handling
+- Optimizes resource utilization
+- Provides performance monitoring
+
+### 6. Window Management (`windowing.py`)
+- Calculates time-based windows
+- Manages window boundaries and overlap
+- Supports different window types
+- Coordinates with watermark tracking
+
+### 7. Output System (`output.py`)
+- Manages output destinations
+- Handles data writing and validation
+- Provides output metrics and monitoring
+- Supports multiple output formats
+
+### 8. Authentication (`auth.py`)
+- Manages authentication methods
+- Handles token refresh and rotation
+- Provides secure credential management
+- Supports multiple auth strategies
+
+### 9. Data Models (`models.py`)
+- Defines core data structures
 - Ensures type safety and validation
+- Provides configuration models
+- Supports extensible schemas
 
-### 3. Factory Pattern (`factory.py`)
-- Implements component creation logic
-- Manages registration of output handlers
-- Creates pipeline instances dynamically
+### 10. Factory Pattern (`factory.py`)
+- Creates component instances
+- Manages component registration
+- Handles configuration parsing
 - Enables plug-and-play architecture
 
-### 4. Pipeline Manager (`pipeline_manager.py`)
-- Central orchestrator of the system
-- Manages pipeline configurations
-- Handles pipeline execution flow
-- Tracks execution status
+### 11. Pipeline Manager (`pipeline_manager.py`)
+- Orchestrates component interactions
+- Manages pipeline execution
+- Tracks pipeline status
 - Provides monitoring interface
 
 ## Extensibility Points
@@ -167,36 +387,83 @@ classDiagram
 
 1. **Pipeline Creation**
    - `PipelineManager` loads configurations
-   - `PipelineFactory` creates components
+   - `PipelineFactory` creates components:
+     - Initializes auth handler
+     - Creates retry handler
+     - Sets up watermark handler
+     - Configures pagination strategy
+     - Prepares parallel processing
+     - Initializes output handlers
    - Components are initialized with configs
 
 2. **Pipeline Execution**
    - Manager triggers execution
-   - Extractor fetches data
-   - Data flows through transforms
+   - Watermark handler determines processing windows
+   - For each window:
+     - Parallel processor manages concurrent execution
+     - Extractor fetches data with pagination
+     - Retry handler manages failed requests
+     - Data flows through transforms
    - Outputs write to destinations
+   - Watermark is updated
 
-3. **Status Tracking**
+3. **Component Interaction**
+   - Base extractor coordinates components
+   - Retry handler wraps HTTP requests
+   - Watermark handler tracks progress
+   - Pagination handles request continuation
+   - Window manager calculates boundaries
+   - Output handlers manage destinations
+
+4. **Status Tracking**
    - Run status is updated
-   - Errors are captured
-   - Metrics are collected
+   - Component metrics are collected:
+     - Retry statistics
+     - Watermark progress
+     - Pagination metrics
+     - Processing windows
+     - Output statistics
+   - Errors are captured and categorized
 
 ## Design Benefits
 
 1. **Loose Coupling**
-   - Components interact through interfaces
-   - Implementation details are isolated
-   - Easy to modify or replace components
+   - Components interact through well-defined interfaces
+   - Implementation details are isolated in dedicated modules
+   - Easy to modify or replace individual components
+   - Clear separation between core and specialized functionality
 
 2. **High Cohesion**
-   - Each class has a single responsibility
-   - Clear separation of concerns
-   - Easy to maintain and test
+   - Each module has a single, focused responsibility
+   - Clear separation of concerns in dedicated files
+   - Easy to maintain and test individual components
+   - Simplified debugging and error tracking
 
 3. **Extensibility**
-   - New extractors can be added
-   - New outputs can be integrated
-   - Configurations are flexible
+   - New extractors can be added without modifying core
+   - New outputs can be integrated seamlessly
+   - Custom components can be easily plugged in
+   - Configurations are flexible and modular
+
+4. **Modularity**
+   - Specialized functionality in dedicated modules
+   - Clear interface boundaries between components
+   - Dependency injection for flexible configuration
+   - Factory pattern for component creation
+   - Easy to add new features in isolation
+
+5. **Maintainability**
+   - Clear organization of code by functionality
+   - Comprehensive documentation per module
+   - Type hints and validation throughout
+   - Consistent coding standards
+   - Isolated testing of components
+
+6. **Reusability**
+   - Common functionality extracted to shared modules
+   - Standardized interfaces across components
+   - Configurable components for different use cases
+   - Easy to share code between extractors
 
 ## Design Principles
 

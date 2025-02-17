@@ -8,373 +8,92 @@ from loguru import logger
 from pydantic import BaseModel, Field
 import random
 import time
-import backoff
 
 from api_pipeline.core.auth import AuthConfig, create_auth_handler
-
-
-class ProcessingPattern(str, Enum):
-    """Defines how the extractor processes items.
-    
-    BATCH: Process multiple items, each requiring its own API call (e.g., /api/user/{id})
-    SINGLE: Process one request that returns multiple items (e.g., /api/users?page=1)
-    """
-    BATCH = "batch"
-    SINGLE = "single"
-
-
-class PaginationType(str, Enum):
-    """Supported pagination types."""
-    PAGE_NUMBER = "page_number"  # e.g., ?page=1&per_page=100
-    CURSOR = "cursor"           # e.g., ?cursor=abc123
-    OFFSET = "offset"           # e.g., ?offset=100&limit=50
-    TOKEN = "token"             # e.g., ?page_token=xyz789
-    LINK = "link"               # Uses Link headers (like GitHub)
-
-
-class ParallelProcessingStrategy(Enum):
-    NONE = "none"
-    TIME_WINDOWS = "time_windows"
-    KNOWN_PAGES = "known_pages"
-    CALCULATED_OFFSETS = "calculated_offsets"
-
-
-class TimeWindowParallelConfig(BaseModel):
-    """Configuration for time-based parallel processing"""
-    window_size: str = "24h"  # e.g., "24h", "7d"
-    window_overlap: str = "0m"  # overlap between windows
-    max_concurrent_windows: int = 5
-    timestamp_format: str = "%Y-%m-%dT%H:%M:%SZ"
-
-
-class KnownPagesParallelConfig(BaseModel):
-    """Configuration for page-based parallel processing"""
-    max_concurrent_pages: int = 5
-    require_total_count: bool = True
-    safe_page_size: int = 100
-
-
-class CalculatedOffsetParallelConfig(BaseModel):
-    """Configuration for offset-based parallel processing"""
-    max_concurrent_chunks: int = 5
-    chunk_size: int = 1000
-    require_total_count: bool = True
-
-
-ParallelConfig = Union[
+from api_pipeline.core.types import (
+    ProcessingPattern,
+    PaginationType,
+    ParallelProcessingStrategy,
+    WindowType
+)
+from api_pipeline.core.pagination import (
+    PaginationConfig,
+    PaginationStrategy,
+    PageNumberConfig,
+    CursorConfig,
+    OffsetConfig,
+    LinkHeaderConfig,
+    PageNumberStrategy,
+    CursorStrategy,
+    LinkHeaderStrategy,
+    OffsetStrategy,
+    PaginationStrategyConfig
+)
+from api_pipeline.core.windowing import (
+    WindowConfig,
+    calculate_window_bounds
+)
+from api_pipeline.core.watermark import (
+    WatermarkConfig,
+    WatermarkHandler
+)
+from api_pipeline.core.retry import RetryConfig, RetryHandler
+from api_pipeline.core.parallel import (
     TimeWindowParallelConfig,
     KnownPagesParallelConfig,
-    CalculatedOffsetParallelConfig
-]
-
-
-class PaginationStrategy(ABC):
-    """Abstract base class for pagination strategies."""
-    
-    @abstractmethod
-    async def get_next_page_params(self, 
-        current_params: Dict[str, Any],
-        response: Dict[str, Any],
-        page_number: int
-    ) -> Optional[Dict[str, Any]]:
-        """Get parameters for the next page based on current response.
-        
-        Args:
-            current_params: Current request parameters
-            response: Current page response
-            page_number: Current page number (1-based)
-            
-        Returns:
-            Parameters for next page, or None if no more pages
-        """
-        pass
-    
-    @abstractmethod
-    def get_initial_params(self, base_params: Dict[str, Any], page_size: int) -> Dict[str, Any]:
-        """Get parameters for the first page.
-        
-        Args:
-            base_params: Base request parameters
-            page_size: Number of items per page
-            
-        Returns:
-            Parameters for first page
-        """
-        pass
-
-
-class PageNumberStrategy(PaginationStrategy):
-    """Strategy for page number based pagination."""
-    
-    def __init__(self, page_param: str = "page", size_param: str = "per_page"):
-        self.page_param = page_param
-        self.size_param = size_param
-    
-    async def get_next_page_params(self, 
-        current_params: Dict[str, Any],
-        response: Dict[str, Any],
-        page_number: int
-    ) -> Optional[Dict[str, Any]]:
-        # If we got a full page, there might be more
-        items = response if isinstance(response, list) else []
-        if len(items) >= current_params[self.size_param]:
-            params = current_params.copy()
-            params[self.page_param] = page_number + 1
-            return params
-        return None
-    
-    def get_initial_params(self, base_params: Dict[str, Any], page_size: int) -> Dict[str, Any]:
-        params = base_params.copy()
-        params[self.page_param] = 1
-        params[self.size_param] = page_size
-        return params
-
-
-class CursorStrategy(PaginationStrategy):
-    """Strategy for cursor based pagination."""
-    
-    def __init__(self, cursor_param: str = "cursor", cursor_field: str = "next_cursor"):
-        self.cursor_param = cursor_param
-        self.cursor_field = cursor_field
-    
-    async def get_next_page_params(self,
-        current_params: Dict[str, Any],
-        response: Dict[str, Any],
-        page_number: int
-    ) -> Optional[Dict[str, Any]]:
-        next_cursor = response.get(self.cursor_field)
-        if next_cursor:
-            params = current_params.copy()
-            params[self.cursor_param] = next_cursor
-            return params
-        return None
-    
-    def get_initial_params(self, base_params: Dict[str, Any], page_size: int) -> Dict[str, Any]:
-        return base_params.copy()  # Cursor usually doesn't need initial params
-
-
-class LinkHeaderStrategy(PaginationStrategy):
-    """Strategy for Link header based pagination (like GitHub)."""
-    
-    async def get_next_page_params(self,
-        current_params: Dict[str, Any],
-        response: Dict[str, Any],
-        page_number: int
-    ) -> Optional[Dict[str, Any]]:
-        # Extract next link from Link header
-        links = response.get("headers", {}).get("Link", "")
-        for link in links.split(","):
-            if 'rel="next"' in link:
-                url = link.split(";")[0].strip()[1:-1]
-                # Parse URL params into dict
-                from urllib.parse import urlparse, parse_qs
-                parsed = urlparse(url)
-                params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
-                return params
-        return None
-    
-    def get_initial_params(self, base_params: Dict[str, Any], page_size: int) -> Dict[str, Any]:
-        return base_params.copy()
-
-
-class OffsetStrategy(PaginationStrategy):
-    """Strategy for offset based pagination."""
-    
-    def __init__(self, offset_param: str = "offset", limit_param: str = "limit"):
-        self.offset_param = offset_param
-        self.limit_param = limit_param
-    
-    async def get_next_page_params(self,
-        current_params: Dict[str, Any],
-        response: Dict[str, Any],
-        page_number: int
-    ) -> Optional[Dict[str, Any]]:
-        current_offset = current_params.get(self.offset_param, 0)
-        limit = current_params[self.limit_param]
-        items = response if isinstance(response, list) else []
-        
-        if len(items) >= limit:
-            params = current_params.copy()
-            params[self.offset_param] = current_offset + limit
-            return params
-        return None
-    
-    def get_initial_params(self, base_params: Dict[str, Any], page_size: int) -> Dict[str, Any]:
-        params = base_params.copy()
-        params[self.offset_param] = 0
-        params[self.limit_param] = page_size
-        return params
-
-
-class PaginationConfig(BaseModel):
-    """Enhanced pagination configuration with strategy pattern."""
-    enabled: bool = True
-    strategy: PaginationStrategy
-    page_size: int = 100
-    max_pages: Optional[int] = None
-    
-    @classmethod
-    def with_page_numbers(cls, page_size: int = 100, **kwargs) -> 'PaginationConfig':
-        """Factory method for page number pagination."""
-        return cls(
-            strategy=PageNumberStrategy(**kwargs),
-            page_size=page_size
-        )
-    
-    @classmethod
-    def with_cursor(cls, page_size: int = 100, **kwargs) -> 'PaginationConfig':
-        """Factory method for cursor-based pagination."""
-        return cls(
-            strategy=CursorStrategy(**kwargs),
-            page_size=page_size
-        )
-    
-    @classmethod
-    def with_offset(cls, page_size: int = 100, **kwargs) -> 'PaginationConfig':
-        """Factory method for offset-based pagination."""
-        return cls(
-            strategy=OffsetStrategy(**kwargs),
-            page_size=page_size
-        )
-    
-    @classmethod
-    def with_link_header(cls, page_size: int = 100) -> 'PaginationConfig':
-        """Factory method for Link header pagination."""
-        return cls(
-            strategy=LinkHeaderStrategy(),
-            page_size=page_size
-        )
-
-
-class RetryConfig(BaseModel):
-    """Configuration for retry mechanism."""
-    max_attempts: int = 3
-    max_time: int = 30
-    base_delay: float = 1.0
-    max_delay: float = 10.0
-    jitter: bool = True
-    retry_on: List[int] = [429, 503, 504]
-
-
-class WindowType(str, Enum):
-    """Supported window types for batch processing."""
-    FIXED = "fixed"      # Fixed-size time windows
-    SLIDING = "sliding"  # Sliding windows with overlap
-    SESSION = "session"  # Session-based windows
-
-
-class WindowConfig(BaseModel):
-    """Configuration for time-based windowing."""
-    window_type: WindowType = WindowType.FIXED
-    window_size: str = "1h"  # Duration string (e.g., "1h", "1d", "7d")
-    window_offset: str = "0m"  # Offset for window start
-    window_overlap: str = "0m"  # For sliding windows
-    timestamp_field: str = "timestamp"  # Field to use for windowing
-    
-    @property
-    def window_size_seconds(self) -> int:
-        """Convert window size string to seconds."""
-        return self._parse_duration(self.window_size)
-    
-    @property
-    def window_offset_seconds(self) -> int:
-        """Convert window offset string to seconds."""
-        return self._parse_duration(self.window_offset)
-    
-    @property
-    def window_overlap_seconds(self) -> int:
-        """Convert window overlap string to seconds."""
-        return self._parse_duration(self.window_overlap)
-    
-    def _parse_duration(self, duration: str) -> int:
-        """Parse duration string to seconds."""
-        unit = duration[-1].lower()
-        value = int(duration[:-1])
-        
-        if unit == 's':
-            return value
-        elif unit == 'm':
-            return value * 60
-        elif unit == 'h':
-            return value * 3600
-        elif unit == 'd':
-            return value * 86400
-        else:
-            raise ValueError(f"Unsupported duration unit: {unit}")
-
-
-class WatermarkConfig(BaseModel):
-    """Configuration for watermark-based extraction."""
-    enabled: bool = False
-    timestamp_field: str = "updated_at"  # Field to track for watermark
-    watermark_field: str = "last_watermark"  # Field to store watermark value
-    window: Optional[WindowConfig] = None
-    initial_watermark: Optional[datetime] = None
-    lookback_window: str = "0m"  # How far to look back from watermark
-    
-    # Time range parameter names for API requests
-    start_time_param: str = "start_time"  # Parameter name for start time
-    end_time_param: str = "end_time"      # Parameter name for end time
-    time_format: str = "%Y-%m-%dT%H:%M:%SZ"  # Format for time parameters
-    
-    @property
-    def lookback_seconds(self) -> int:
-        """Convert lookback window to seconds."""
-        if not self.lookback_window:
-            return 0
-        return WindowConfig._parse_duration(self.lookback_window)
+    CalculatedOffsetParallelConfig,
+    ParallelConfig
+)
 
 
 class ExtractorConfig(BaseModel):
-    base_url: str
-    endpoints: Dict[str, str]  # URL templates with {param} placeholders
-    auth_config: AuthConfig
-    processing_pattern: ProcessingPattern = ProcessingPattern.SINGLE
-    batch_parameter_name: Optional[str] = None
-    rate_limit: Optional[int] = None
-    retry_count: Optional[int] = None
-    batch_size: int = 100
-    max_concurrent_requests: int = 10
-    session_timeout: int = 30
-    pagination: Optional[PaginationConfig] = None
-    retry: RetryConfig = RetryConfig()
-    watermark: Optional[WatermarkConfig] = None
+    # Main configuration for API data extraction
+    base_url: str                                        # Base URL for API
+    endpoints: Dict[str, str]                           # URL templates with {param} placeholders
+    auth_config: AuthConfig                             # Authentication configuration
+    processing_pattern: ProcessingPattern = ProcessingPattern.SINGLE  # How to process items
+    batch_parameter_name: Optional[str] = None          # Parameter name for batch items
+    rate_limit: Optional[int] = None                    # Maximum requests per second
+    retry_count: Optional[int] = None                   # Number of retries
+    batch_size: int = 100                              # Items per batch
+    max_concurrent_requests: int = 10                   # Maximum parallel requests
+    session_timeout: int = 30                          # Request timeout in seconds
+    pagination: Optional[PaginationConfig] = None       # Pagination configuration
+    retry: RetryConfig = RetryConfig()                 # Retry configuration
+    watermark: Optional[WatermarkConfig] = None        # Watermark configuration
 
 
 class BaseExtractor(ABC):
-    """Base class for all extractors with built-in performance optimizations.
+    # Base class for API data extractors with built-in optimizations:
+    # - Concurrent request processing
+    # - Automatic batching
+    # - Connection pooling
+    # - Rate limiting
+    # - Resource management
+    # - Retry mechanism
+    # - Metrics tracking
+    # - Watermark-based extraction
+    # - Fixed window batching
     
-    Features:
-    - Concurrent request processing
-    - Automatic batching
-    - Connection pooling
-    - Rate limiting
-    - Resource management
-    - Retry mechanism
-    - Metrics tracking
-    - Watermark-based extraction
-    - Fixed window batching
-    """
-    
-    # Custom exception classes
+    # Custom exception classes for different error scenarios
     class ExtractorError(Exception):
-        """Base class for extractor errors."""
+        # Base class for extractor errors
         pass
 
     class AuthenticationError(ExtractorError):
-        """Raised when authentication fails."""
+        # Raised when authentication fails
         pass
 
     class RateLimitError(ExtractorError):
-        """Raised when rate limit is exceeded."""
+        # Raised when rate limit is exceeded
         pass
 
     class ValidationError(ExtractorError):
-        """Raised when parameters or data validation fails."""
+        # Raised when parameters or data validation fails
         pass
 
     class WatermarkError(ExtractorError):
-        """Raised when watermark handling fails."""
+        # Raised when watermark handling fails
         pass
 
     DEFAULT_PAGE_SIZE = 100
@@ -385,8 +104,9 @@ class BaseExtractor(ABC):
         self.auth_handler = create_auth_handler(config.auth_config)
         self._semaphore = asyncio.Semaphore(self.config.max_concurrent_requests)
         self._rate_limiter = asyncio.Semaphore(config.rate_limit or float('inf'))
-        self._retry_state: Dict[str, Any] = {}
-        self._current_watermark: Optional[datetime] = None
+        self.retry_handler = RetryHandler(config.retry)
+        if self.config.watermark:
+            self.watermark_handler = WatermarkHandler(self.config.watermark)
         self._metrics = {
             'requests_made': 0,
             'requests_failed': 0,
@@ -395,8 +115,16 @@ class BaseExtractor(ABC):
             'total_processing_time': 0.0,
             'rate_limit_hits': 0,
             'auth_failures': 0,
-            'watermark_updates': 0,
-            'window_count': 0
+            'window_count': 0,
+            'batch_count': 0,
+            'failed_batches': 0,
+            'bytes_processed': 0,
+            'last_request_time': None,
+            'average_batch_size': 0,
+            'max_batch_size': 0,
+            'min_batch_size': float('inf'),
+            'total_batch_size': 0,
+            'watermark_updates': 0
         }
         self._start_time = time.monotonic()
 
@@ -414,21 +142,51 @@ class BaseExtractor(ABC):
         if self.session:
             await self.session.close()
             self.session = None
-        self._retry_state.clear()
 
     def get_metrics(self) -> Dict[str, Any]:
         """Get current metrics for monitoring."""
         current_time = time.monotonic()
         metrics = self._metrics.copy()
-        metrics['uptime'] = current_time - self._start_time
+        uptime = current_time - self._start_time
+        
+        # Calculate derived metrics
+        metrics['uptime'] = uptime
         metrics['requests_per_second'] = (
-            metrics['requests_made'] / metrics['uptime']
-            if metrics['uptime'] > 0 else 0
+            metrics['requests_made'] / uptime
+            if uptime > 0 else 0
         )
         metrics['success_rate'] = (
             (metrics['requests_made'] - metrics['requests_failed']) / metrics['requests_made']
             if metrics['requests_made'] > 0 else 0
         )
+        metrics['average_processing_time_per_item'] = (
+            metrics['total_processing_time'] / metrics['items_processed']
+            if metrics['items_processed'] > 0 else 0
+        )
+        metrics['batch_success_rate'] = (
+            (metrics['batch_count'] - metrics['failed_batches']) / metrics['batch_count']
+            if metrics['batch_count'] > 0 else 0
+        )
+        metrics['average_batch_size'] = (
+            metrics['items_processed'] / metrics['batch_count']
+            if metrics['batch_count'] > 0 else 0
+        )
+        
+        # Add auth metrics if available
+        if hasattr(self, 'auth_handler'):
+            auth_metrics = self.auth_handler.get_metrics()
+            metrics.update(auth_metrics)
+        
+        # Add retry metrics if available
+        if hasattr(self, 'retry_handler'):
+            retry_metrics = self.retry_handler.get_metrics()
+            metrics.update(retry_metrics)
+        
+        # Add watermark metrics if available
+        if hasattr(self, 'watermark_handler'):
+            watermark_metrics = self.watermark_handler.get_metrics()
+            metrics.update(watermark_metrics)
+        
         return metrics
 
     async def _ensure_session(self):
@@ -442,7 +200,9 @@ class BaseExtractor(ABC):
             self.session = aiohttp.ClientSession(headers=headers)
 
     def _get_additional_headers(self) -> Dict[str, str]:
-        """Get additional headers for the API. Override in subclass if needed."""
+        # Get additional headers for API requests
+        # Override in subclass to add custom headers
+        # Returns: Dictionary of header name to value
         return {}
 
     @abstractmethod
@@ -479,6 +239,9 @@ class BaseExtractor(ABC):
         params: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
         """Process a batch of items concurrently."""
+        self._metrics['batch_count'] += 1
+        batch_start_time = time.monotonic()
+        
         async def process_item(item: Any) -> List[Dict[str, Any]]:
             try:
                 async with self._semaphore:
@@ -487,9 +250,12 @@ class BaseExtractor(ABC):
                         params={**(params or {}), **self._get_item_params(item)}
                     )
                     items = data if isinstance(data, list) else [data]
-                    return [await self._transform_item(item) for item in items]
+                    transformed_items = [await self._transform_item(item) for item in items]
+                    self._metrics['items_processed'] += len(transformed_items)
+                    return transformed_items
             except Exception as e:
                 logger.error(f"Failed to process item {item}: {str(e)}")
+                self._metrics['failed_batches'] += 1
                 return []
 
         tasks = [process_item(item) for item in batch]
@@ -501,6 +267,18 @@ class BaseExtractor(ABC):
                 processed_data.extend(result)
             else:
                 logger.error(f"Batch processing error: {str(result)}")
+                self._metrics['failed_batches'] += 1
+        
+        # Update batch metrics
+        batch_time = time.monotonic() - batch_start_time
+        self._metrics['total_processing_time'] += batch_time
+        self._metrics['total_batch_size'] += len(processed_data)
+        self._metrics['max_batch_size'] = max(self._metrics['max_batch_size'], len(processed_data))
+        if len(processed_data) > 0:
+            self._metrics['min_batch_size'] = min(
+                self._metrics['min_batch_size'] if self._metrics['min_batch_size'] != float('inf') else len(processed_data),
+                len(processed_data)
+            )
         
         return processed_data
 
@@ -517,10 +295,14 @@ class BaseExtractor(ABC):
         """Make paginated requests using the configured pagination strategy."""
         await self._ensure_session()
         all_results = []
+        request_start_time = time.monotonic()
         
         if not self.config.pagination or not self.config.pagination.enabled:
             response = await self._make_request(endpoint, params, endpoint_override)
-            return self._extract_items(response)
+            items = self._extract_items(response)
+            self._metrics['requests_made'] += 1
+            self._metrics['bytes_processed'] += len(str(response).encode())
+            return items
 
         # Get initial parameters from the strategy
         page_params = self.config.pagination.strategy.get_initial_params(
@@ -537,6 +319,8 @@ class BaseExtractor(ABC):
                 logger.info(f"Making request for page {page_count + 1} with params: {page_params}")
                 async with self._semaphore:
                     response = await self._make_request(endpoint, page_params, endpoint_override)
+                    self._metrics['requests_made'] += 1
+                    self._metrics['bytes_processed'] += len(str(response).encode())
                     
                 items = self._extract_items(response)
                 logger.info(f"Received {len(items)} items in page {page_count + 1}")
@@ -561,8 +345,14 @@ class BaseExtractor(ABC):
 
             except Exception as e:
                 logger.error(f"Pagination request failed: {str(e)}")
+                self._metrics['requests_failed'] += 1
                 break
 
+        # Update request metrics
+        request_time = time.monotonic() - request_start_time
+        self._metrics['total_processing_time'] += request_time
+        self._metrics['last_request_time'] = datetime.now(UTC)
+        
         logger.info(f"Completed pagination with {page_count} pages and {len(all_results)} total items")
         return all_results
 
@@ -707,17 +497,13 @@ class BaseExtractor(ABC):
         return params
 
     async def extract(self, parameters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        """
-        Extract data with built-in batching, parallel processing, and watermark support.
-        Override _transform_item() instead of this method.
-        """
+        """Extract data with built-in batching, parallel processing, and watermark support."""
         try:
             parameters = parameters or {}
             
             # Get last watermark if enabled
             if self.config.watermark and self.config.watermark.enabled:
-                self._current_watermark = await self._get_last_watermark()
-                start_time = self._current_watermark
+                start_time = await self.watermark_handler.get_last_watermark()
                 if not start_time:
                     start_time = (
                         self.config.watermark.initial_watermark or 
@@ -739,7 +525,7 @@ class BaseExtractor(ABC):
                     logger.info(f"Processing window: {window_start} to {window_end}")
                     
                     # Apply watermark filters
-                    window_params = self._apply_watermark_filters(
+                    window_params = self.watermark_handler.apply_watermark_filters(
                         parameters, window_start, window_end
                     )
                     
@@ -763,12 +549,12 @@ class BaseExtractor(ABC):
                 
                 # Update final watermark
                 if max_watermark > start_time:
-                    await self._update_watermark(max_watermark)
+                    await self.watermark_handler.update_watermark(max_watermark)
                 
                 return all_data
                 
             else:
-                # Non-watermark based extraction (existing implementation)
+                # Non-watermark based extraction
                 items = self._get_items_to_process(parameters)
                 if not items:
                     logger.warning("No items to process")
@@ -861,100 +647,14 @@ class BaseExtractor(ABC):
         """Make a single request with retries and rate limiting."""
         params = params or {}
         url = self._get_url(endpoint, params, endpoint_override)
-        
-        async with self.session.get(url, params=params) as response:
-            response.raise_for_status()
-            return await response.json()
-
-    def _get_retry_state(self, request_id: str) -> Dict[str, Any]:
-        """Get or create retry state for a request."""
-        if request_id not in self._retry_state:
-            self._retry_state[request_id] = {
-                'attempts': 0,
-                'start_time': time.monotonic(),
-                'last_error': None
-            }
-        return self._retry_state[request_id]
-
-    def _calculate_delay(self, attempt: int) -> float:
-        """Calculate exponential backoff delay with jitter."""
-        delay = min(
-            self.config.retry.base_delay * (2 ** attempt),
-            self.config.retry.max_delay
-        )
-        if self.config.retry.jitter:
-            delay *= (1 + random.random())
-        return delay
-
-    def _should_retry(self, status_code: int) -> bool:
-        """Determine if request should be retried based on status."""
-        return (
-            status_code in self.config.retry.retry_on or
-            status_code >= 500
-        )
-
-    @backoff.on_exception(
-        backoff.expo,
-        (aiohttp.ClientError, TimeoutError),
-        max_tries=lambda self: self.config.retry.max_attempts,
-        max_time=lambda self: self.config.retry.max_time,
-        on_backoff=lambda details: logger.warning(f"Retrying request: {details}")
-    )
-    async def _do_request(self, endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Make HTTP request with exponential backoff retry."""
         request_id = f"{endpoint}:{hash(str(params))}"
-        state = self._get_retry_state(request_id)
         
-        try:
-            async with self.session.get(
-                f"{self.config.base_url}{self.config.endpoints[endpoint]}",
-                params=params
-            ) as response:
-                if response.status == 429:  # Rate limit
-                    retry_after = int(response.headers.get('Retry-After', 5))
-                    logger.warning(f"Rate limited. Waiting {retry_after} seconds")
-                    await asyncio.sleep(retry_after)
-                    raise aiohttp.ClientResponseError(
-                        response.request_info,
-                        response.history,
-                        status=429
-                    )
-                
+        async def do_request():
+            async with self.session.get(url, params=params) as response:
                 response.raise_for_status()
                 return await response.json()
-                
-        except aiohttp.ClientResponseError as e:
-            state['attempts'] += 1
-            state['last_error'] = str(e)
-            
-            if self._should_retry(e.status):
-                if time.monotonic() - state['start_time'] < self.config.retry.max_time:
-                    delay = self._calculate_delay(state['attempts'])
-                    logger.warning(f"Request failed with {e.status}. Retrying in {delay:.2f}s")
-                    await asyncio.sleep(delay)
-                    raise  # Will be retried by backoff decorator
-                else:
-                    logger.error(f"Max retry time exceeded for {request_id}")
-            
-            logger.error(f"Request failed: {str(e)}")
-            raise
-            
-        except (aiohttp.ClientError, TimeoutError) as e:
-            state['attempts'] += 1
-            state['last_error'] = str(e)
-            
-            if state['attempts'] < self.config.retry.max_attempts:
-                delay = self._calculate_delay(state['attempts'])
-                logger.warning(f"Network error. Retrying in {delay:.2f}s")
-                await asyncio.sleep(delay)
-                raise  # Will be retried by backoff decorator
-            else:
-                logger.error(f"Max retry attempts exceeded for {request_id}")
-                raise
         
-        finally:
-            if state['attempts'] >= self.config.retry.max_attempts:
-                self._retry_state.pop(request_id, None)
+        return await self.retry_handler.execute_with_retry(request_id, do_request)
 
     def _get_endpoint_override(self, parameters: Dict[str, Any]) -> Optional[str]:
         """Get the endpoint override for the API request.
@@ -1099,19 +799,159 @@ class BaseExtractor(ABC):
         return datetime.now(UTC)
 
     async def _process_known_pages(self, parameters: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Process data using parallel page fetching"""
-        # Implementation for page-based parallel processing
-        raise NotImplementedError("Page-based parallel processing not implemented yet")
+        # Process data using parallel page fetching when total pages are known
+        # This strategy works best when API provides total count/pages information
+        # Returns: Combined results from all parallel page fetches
+        
+        if not isinstance(self.config.pagination.parallel_config, KnownPagesParallelConfig):
+            raise ValueError("Known pages configuration required for page-based parallel processing")
+            
+        config = self.config.pagination.parallel_config
+        
+        # Get total pages if API provides it
+        first_page = await self._make_request(
+            next(iter(self.config.endpoints.keys())),
+            parameters
+        )
+        
+        if config.require_total_count:
+            if 'total' not in first_page:
+                raise ValueError("API response missing required 'total' field")
+            total_items = first_page['total']
+            total_pages = (total_items + config.safe_page_size - 1) // config.safe_page_size
+        else:
+            # Start with first page and discover more as needed
+            total_pages = 1
+            
+        # Process pages in parallel with concurrency limit
+        semaphore = asyncio.Semaphore(config.max_concurrent_pages)
+        
+        async def fetch_page(page_number: int) -> List[Dict[str, Any]]:
+            async with semaphore:
+                page_params = parameters.copy()
+                page_params['page'] = page_number
+                page_params['per_page'] = config.safe_page_size
+                response = await self._make_request(
+                    next(iter(self.config.endpoints.keys())),
+                    page_params
+                )
+                return self._extract_items(response)
+                
+        tasks = [fetch_page(page) for page in range(1, total_pages + 1)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Combine and filter results
+        all_items = []
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"Page processing failed: {str(result)}")
+                continue
+            all_items.extend(result)
+            
+        return all_items
 
     async def _process_calculated_offsets(self, parameters: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Process data using parallel offset fetching"""
-        # Implementation for offset-based parallel processing
-        raise NotImplementedError("Offset-based parallel processing not implemented yet")
+        # Process data using parallel offset-based fetching
+        # This strategy works by calculating offset ranges based on chunk size
+        # Returns: Combined results from all parallel chunk fetches
+        
+        if not isinstance(self.config.pagination.parallel_config, CalculatedOffsetParallelConfig):
+            raise ValueError("Calculated offset configuration required for offset-based parallel processing")
+            
+        config = self.config.pagination.parallel_config
+        
+        # Get total count if required
+        if config.require_total_count:
+            first_response = await self._make_request(
+                next(iter(self.config.endpoints.keys())),
+                parameters
+            )
+            if 'total' not in first_response:
+                raise ValueError("API response missing required 'total' field")
+            total_items = first_response['total']
+        else:
+            # Start with one chunk and discover more as needed
+            total_items = config.chunk_size
+            
+        # Calculate chunks
+        chunks = []
+        for offset in range(0, total_items, config.chunk_size):
+            chunks.append((offset, min(offset + config.chunk_size, total_items)))
+            
+        # Process chunks in parallel with concurrency limit
+        semaphore = asyncio.Semaphore(config.max_concurrent_chunks)
+        
+        async def fetch_chunk(start: int, end: int) -> List[Dict[str, Any]]:
+            async with semaphore:
+                chunk_params = parameters.copy()
+                chunk_params['offset'] = start
+                chunk_params['limit'] = end - start
+                response = await self._make_request(
+                    next(iter(self.config.endpoints.keys())),
+                    chunk_params
+                )
+                return self._extract_items(response)
+                
+        tasks = [fetch_chunk(start, end) for start, end in chunks]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Combine and filter results
+        all_items = []
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"Chunk processing failed: {str(result)}")
+                continue
+            all_items.extend(result)
+            
+        return all_items
 
     async def _process_sequential(self, parameters: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Process data sequentially (existing pagination logic)"""
-        # Move existing pagination logic here
-        raise NotImplementedError("Sequential processing must be implemented by subclass")
+        # Process data sequentially using standard pagination
+        # This is the default processing mode when parallel processing is not enabled
+        # Returns: List of processed items from all pages
+        
+        all_results = []
+        page_count = 0
+        
+        # Get initial parameters from pagination strategy
+        page_params = self.config.pagination.strategy.get_initial_params(
+            parameters or {}, 
+            self.config.pagination.page_size
+        )
+        
+        while True:
+            try:
+                # Fetch and process current page
+                response = await self._make_request(
+                    next(iter(self.config.endpoints.keys())),
+                    page_params
+                )
+                
+                items = self._extract_items(response)
+                all_results.extend(items)
+                page_count += 1
+                
+                # Check if we should continue pagination
+                if self.config.pagination.max_pages and page_count >= self.config.pagination.max_pages:
+                    break
+                    
+                # Get next page parameters from strategy
+                next_params = await self.config.pagination.strategy.get_next_page_params(
+                    page_params,
+                    response,
+                    page_count
+                )
+                
+                if not next_params:
+                    break
+                    
+                page_params = next_params
+                
+            except Exception as e:
+                logger.error(f"Sequential processing failed: {str(e)}")
+                break
+                
+        return all_results
 
 
 class OutputConfig(BaseModel):
@@ -1131,7 +971,12 @@ class BaseOutput(ABC):
             'bytes_written': 0,
             'write_errors': 0,
             'last_write_time': None,
-            'total_write_time': 0.0
+            'total_write_time': 0.0,
+            'batch_count': 0,
+            'failed_batches': 0,
+            'max_batch_size': 0,
+            'min_batch_size': float('inf'),
+            'total_batch_size': 0
         }
         self._start_time = time.monotonic()
 
@@ -1156,23 +1001,29 @@ class BaseOutput(ABC):
         """
         pass
 
-    @abstractmethod
     async def write(self, data: List[Dict[str, Any]]) -> None:
-        """Write data to the output destination.
-        
-        Args:
-            data: List of records to write
-            
-        Raises:
-            Exception: If write operation fails
-        """
+        """Write data to the output destination."""
         start_time = time.monotonic()
         try:
-            # Subclasses should implement actual writing logic
-            self._metrics['records_written'] += len(data)
+            # Update batch metrics
+            batch_size = len(data)
+            self._metrics['batch_count'] += 1
+            self._metrics['total_batch_size'] += batch_size
+            self._metrics['max_batch_size'] = max(self._metrics['max_batch_size'], batch_size)
+            self._metrics['min_batch_size'] = min(self._metrics['min_batch_size'], batch_size)
+            
+            # Update record metrics
+            self._metrics['records_written'] += batch_size
             self._metrics['last_write_time'] = datetime.now(UTC)
+            
+            # Estimate bytes written (approximate)
+            import sys
+            bytes_written = sys.getsizeof(str(data))  # Approximate size
+            self._metrics['bytes_written'] += bytes_written
+            
         except Exception as e:
             self._metrics['write_errors'] += 1
+            self._metrics['failed_batches'] += 1
             raise
         finally:
             write_time = time.monotonic() - start_time
@@ -1191,13 +1042,32 @@ class BaseOutput(ABC):
         """Get current metrics for monitoring."""
         current_time = time.monotonic()
         metrics = self._metrics.copy()
-        metrics['uptime'] = current_time - self._start_time
+        uptime = current_time - self._start_time
+        
+        # Calculate derived metrics
+        metrics['uptime'] = uptime
         metrics['records_per_second'] = (
-            metrics['records_written'] / metrics['uptime']
-            if metrics['uptime'] > 0 else 0
+            metrics['records_written'] / uptime
+            if uptime > 0 else 0
         )
         metrics['average_write_time'] = (
-            metrics['total_write_time'] / metrics['records_written']
-            if metrics['records_written'] > 0 else 0
+            metrics['total_write_time'] / metrics['batch_count']
+            if metrics['batch_count'] > 0 else 0
+        )
+        metrics['error_rate'] = (
+            metrics['write_errors'] / metrics['batch_count']
+            if metrics['batch_count'] > 0 else 0
+        )
+        metrics['average_batch_size'] = (
+            metrics['total_batch_size'] / metrics['batch_count']
+            if metrics['batch_count'] > 0 else 0
+        )
+        metrics['bytes_per_second'] = (
+            metrics['bytes_written'] / uptime
+            if uptime > 0 else 0
+        )
+        metrics['success_rate'] = (
+            (metrics['batch_count'] - metrics['failed_batches']) / metrics['batch_count']
+            if metrics['batch_count'] > 0 else 0
         )
         return metrics 

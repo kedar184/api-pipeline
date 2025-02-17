@@ -5,6 +5,7 @@ from datetime import datetime, UTC
 from typing import Any, Dict, List
 from pathlib import Path
 from loguru import logger
+import time
 
 from api_pipeline.core.base import BaseOutput, OutputConfig
 
@@ -26,6 +27,24 @@ class LocalJsonOutput(BaseOutput):
         self.batch_size = self.config.config.get("batch_size", 1000)  # Default batch size
         self.max_concurrent_writes = self.config.config.get("max_concurrent_writes", 5)  # Limit concurrent writes
         self._semaphore = asyncio.Semaphore(self.max_concurrent_writes)
+        self._metrics = {
+            'records_written': 0,
+            'bytes_written': 0,
+            'write_errors': 0,
+            'total_write_time': 0.0,
+            'last_write_time': None,
+            'batch_count': 0,
+            'failed_batches': 0,
+            'total_batch_size': 0,
+            'max_batch_size': 0,
+            'min_batch_size': float('inf'),
+            'average_batch_size': 0,
+            'bytes_per_second': 0.0,
+            'records_per_second': 0.0,
+            'error_rate': 0.0,
+            'success_rate': 0.0
+        }
+        self._start_time = time.monotonic()
         self._ensure_output_dir()
 
     async def initialize(self) -> None:
@@ -72,6 +91,8 @@ class LocalJsonOutput(BaseOutput):
 
         try:
             async with self._semaphore:  # Limit concurrent writes
+                batch_start_time = time.monotonic()
+                
                 # Get output file path
                 output_file = self._get_output_file(partition_path)
                 
@@ -79,15 +100,36 @@ class LocalJsonOutput(BaseOutput):
                 if self.file_format == "jsonl":
                     with open(output_file, "w") as f:
                         for record in batch:
-                            f.write(json.dumps(record, cls=DateTimeEncoder) + "\n")
+                            line = json.dumps(record, cls=DateTimeEncoder) + "\n"
+                            f.write(line)
+                            self._metrics['bytes_written'] += len(line.encode())
                 else:  # regular json
                     with open(output_file, "w") as f:
-                        json.dump(batch, f, indent=2, cls=DateTimeEncoder)
+                        json_data = json.dumps(batch, indent=2, cls=DateTimeEncoder)
+                        f.write(json_data)
+                        self._metrics['bytes_written'] += len(json_data.encode())
                 
-                logger.info(f"Successfully wrote batch of {len(batch)} records to {output_file}")
+                # Update batch metrics
+                batch_size = len(batch)
+                self._metrics['batch_count'] += 1
+                self._metrics['total_batch_size'] += batch_size
+                self._metrics['max_batch_size'] = max(self._metrics['max_batch_size'], batch_size)
+                self._metrics['min_batch_size'] = min(
+                    self._metrics['min_batch_size'] if self._metrics['min_batch_size'] != float('inf') else batch_size,
+                    batch_size
+                )
+                
+                # Update timing metrics
+                write_time = time.monotonic() - batch_start_time
+                self._metrics['total_write_time'] += write_time
+                self._metrics['last_write_time'] = datetime.now(UTC)
+                
+                logger.info(f"Successfully wrote batch of {batch_size} records to {output_file}")
                 
         except Exception as e:
             logger.error(f"Error writing batch to local JSON file: {str(e)}")
+            self._metrics['write_errors'] += 1
+            self._metrics['failed_batches'] += 1
             raise
 
     async def write(self, data: List[Dict[str, Any]]) -> None:
@@ -97,6 +139,8 @@ class LocalJsonOutput(BaseOutput):
             return
 
         try:
+            write_start_time = time.monotonic()
+            
             # Group data by partition path
             partitioned_data: Dict[str, List[Dict[str, Any]]] = {}
             for record in data:
@@ -119,6 +163,17 @@ class LocalJsonOutput(BaseOutput):
             # Update metrics
             self._metrics['records_written'] += len(data)
             self._metrics['last_write_time'] = datetime.now(UTC)
+            
+            # Calculate derived metrics
+            uptime = time.monotonic() - self._start_time
+            if uptime > 0:
+                self._metrics['bytes_per_second'] = self._metrics['bytes_written'] / uptime
+                self._metrics['records_per_second'] = self._metrics['records_written'] / uptime
+            
+            if self._metrics['batch_count'] > 0:
+                self._metrics['average_batch_size'] = self._metrics['total_batch_size'] / self._metrics['batch_count']
+                self._metrics['error_rate'] = self._metrics['failed_batches'] / self._metrics['batch_count']
+                self._metrics['success_rate'] = 1 - self._metrics['error_rate']
             
         except Exception as e:
             logger.error(f"Error writing to local JSON file: {str(e)}")
