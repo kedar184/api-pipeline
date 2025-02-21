@@ -242,11 +242,15 @@ class BaseExtractor(ABC):
         self._metrics['batch_count'] += 1
         batch_start_time = time.monotonic()
         
+        # Get first endpoint from config
+        endpoint = next(iter(self.config.endpoints.keys()))
+        logger.debug(f"Using endpoint: {endpoint}")
+        
         async def process_item(item: Any) -> List[Dict[str, Any]]:
             try:
                 async with self._semaphore:
                     data = await self._paginated_request(
-                        "current",
+                        endpoint,
                         params={**(params or {}), **self._get_item_params(item)}
                     )
                     items = data if isinstance(data, list) else [data]
@@ -292,11 +296,7 @@ class BaseExtractor(ABC):
         params: Optional[Dict[str, Any]] = None,
         endpoint_override: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Make paginated requests using the configured pagination strategy."""
-        await self._ensure_session()
-        all_results = []
-        request_start_time = time.monotonic()
-        
+        """Make a paginated request and return all results."""
         if not self.config.pagination or not self.config.pagination.enabled:
             response = await self._make_request(endpoint, params, endpoint_override)
             items = self._extract_items(response)
@@ -310,11 +310,18 @@ class BaseExtractor(ABC):
             self.config.pagination.page_size
         )
         page_count = 0
+        all_results = []
+        request_start_time = time.monotonic()
 
         logger.info(f"Starting paginated request with strategy: {self.config.pagination.strategy.__class__.__name__}")
         logger.info(f"Initial parameters: {page_params}")
 
         while True:
+            # Check max_pages limit before making the request
+            if self.config.pagination.max_pages and page_count >= self.config.pagination.max_pages:
+                logger.info(f"Reached max pages limit ({self.config.pagination.max_pages}), stopping pagination")
+                break
+
             try:
                 logger.info(f"Making request for page {page_count + 1} with params: {page_params}")
                 async with self._semaphore:
@@ -335,10 +342,7 @@ class BaseExtractor(ABC):
                 )
                 
                 # If no next parameters, we're done
-                if not next_params or (
-                    self.config.pagination.max_pages and 
-                    page_count >= self.config.pagination.max_pages
-                ):
+                if not next_params:
                     break
 
                 page_params = next_params
@@ -616,40 +620,53 @@ class BaseExtractor(ABC):
         return [parameters]
 
     def _get_url(self, endpoint: str, params: Dict[str, Any], endpoint_override: Optional[str] = None) -> str:
-        """Construct the full URL for a request.
-        
-        Handles URL template parameters in the format {param_name}.
-        Example: "/repos/{repo}/commits" with params={"repo": "apache/spark"}
-        becomes "/repos/apache/spark/commits"
+        """Get full URL with parameters.
         
         Args:
-            endpoint: The endpoint key from config.endpoints
-            params: Request parameters, used both for URL template and query params
-            endpoint_override: Optional override for the entire endpoint path
+            endpoint: Endpoint key from configuration
+            params: Request parameters
+            endpoint_override: Optional override for endpoint URL
             
         Returns:
-            The complete URL with template parameters replaced
-            
-        Raises:
-            ValueError: If a template parameter is missing from params
+            Complete URL with parameters
         """
+        # Get endpoint URL
         if endpoint_override:
-            path = endpoint_override
+            url = endpoint_override
         else:
-            path = self.config.endpoints[endpoint]
+            if endpoint not in self.config.endpoints:
+                raise ValueError(f"Endpoint {endpoint} not found in configuration")
+            url = self.config.endpoints[endpoint]
             
-        try:
-            # Format the URL template with provided parameters
-            path = path.format(**params)
-        except KeyError as e:
-            raise ValueError(f"Missing required URL parameter: {e}")
+        # Add base URL if endpoint doesn't start with http
+        if not url.startswith(('http://', 'https://')):
+            url = f"{self.config.base_url.rstrip('/')}/{url.lstrip('/')}"
             
-        # If the path is already a full URL, return it as is
-        if path.startswith("http://") or path.startswith("https://"):
-            return path
+        # Add parameters
+        query_params = {}
+        
+        # Add configured parameters if any
+        if hasattr(self.config, 'parameters'):
+            query_params.update(self.config.parameters)
             
-        # Otherwise, append it to the base URL
-        return f"{self.config.base_url}{path}"
+        # Add units parameter if present
+        if hasattr(self.config, 'units'):
+            query_params['units'] = self.config.units
+            
+        # Add request parameters
+        query_params.update(params)
+        
+        # Build query string
+        if query_params:
+            param_strings = []
+            for key, value in sorted(query_params.items()):
+                if isinstance(value, (list, tuple)):
+                    param_strings.extend(f"{key}={v}" for v in value)
+                else:
+                    param_strings.append(f"{key}={value}")
+            url = f"{url}{'&' if '?' in url else '?'}{'&'.join(param_strings)}"
+            
+        return url
 
     async def _make_request(
         self,
@@ -662,7 +679,20 @@ class BaseExtractor(ABC):
         
         async def do_request():
             url = self._get_url(endpoint, params or {}, endpoint_override)
-            async with self.session.get(url) as response:
+            # Add additional parameters from config if available
+            request_params = {k: v for k, v in (params or {}).items() 
+                            if isinstance(v, (str, int, float, bool))}
+            
+            # Add API key as query parameter if using api_key auth
+            if hasattr(self.auth_handler, 'get_auth_params'):
+                request_params.update(self.auth_handler.get_auth_params())
+                logger.debug(f"Added auth params: {request_params}")
+            
+            # Get headers including auth headers
+            headers = await self.auth_handler.get_auth_headers()
+            logger.debug(f"Request headers: {headers}")
+            
+            async with self.session.get(url, params=request_params, headers=headers) as response:
                 response.raise_for_status()
                 data = await response.json()
                 # Include headers in the response for pagination

@@ -151,8 +151,27 @@ do not change base extractor implementation focus on chain..
 
 take a step back to reason.. tart small by deleting test steps if needed.. goal is to achieve the wider outcome and not get struck in a loop of errors
 
+we wanted our chain to have the abiity to loop through a list. have we implemented that correctly. check the code
 
-****** some doco prompts
+remember single responsibility principle. githubcommitsextractor should only work on one repo - i.e. it takes a repo name as input and generates a output of commits. 
+We need to modify our chain handling to be able to work with this. it would be a common scenario for many api chaining
+
+we are going in circles so lets focus on chain behavior. we want our chain to work with a list 
+the extractor either provides a single output or a list. Consider the base principle and look through the chain implementation you will find the issue
+
+if extractors return a list always that contain key value pairs will that help to keep behavior consistent and simple ?
+
+lets completely focus on our unit tests with pagination features.. we have to fix that before we progress
+
+decrease timeouts and other strategies as required i want the feedback loop on failures to be fast
+
+lets start building test with openweathermap api. free plan says Please note that the subscription requires your bank card details
+this means whatever we build, we want to ensure there is no bill some checks have to be incorporated
+
+
+****** some doco promptslets completely focus on our unit tests with pagination features.. we have to fix that before we progress
+
+
 write a document on the system design and place it in docs folder
 In system design, can u clearly explain the class diagram for all files in core and how they interact with each other to help the framework being extensible
 looks good. now read the system design document and tell me what is missing in our implementation

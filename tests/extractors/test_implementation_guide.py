@@ -6,8 +6,8 @@ import aiohttp
 from tests.extractors.test_base import BaseExtractor, ExtractorConfig, WatermarkConfig
 from tests.extractors.test_exceptions import ValidationError
 
-class TestApiExtractor(BaseExtractor):
-    """Test API extractor implementation following the guide patterns."""
+class MockApiExtractor(BaseExtractor):
+    """Mock API extractor implementation following the guide patterns."""
     
     def __init__(self, config: ExtractorConfig):
         super().__init__(config)
@@ -112,7 +112,7 @@ def test_parameter_validation():
         "base_url": "https://api.example.com",
         "auth_credentials": {"token": "test"}
     })
-    extractor = TestApiExtractor(config)
+    extractor = MockApiExtractor(config)
     
     with pytest.raises(ValidationError):
         extractor._validate_parameters({})
@@ -125,7 +125,7 @@ def test_parameter_validation():
 
 def test_transform_user():
     config = ExtractorConfig(api_config={})
-    extractor = TestApiExtractor(config)
+    extractor = MockApiExtractor(config)
     
     input_item = {
         "id": "u123",
@@ -144,7 +144,7 @@ def test_transform_user():
 
 def test_transform_order():
     config = ExtractorConfig(api_config={})
-    extractor = TestApiExtractor(config)
+    extractor = MockApiExtractor(config)
     
     input_item = {
         "id": "o123",
@@ -165,14 +165,14 @@ def test_transform_order():
 
 def test_transform_item_invalid_endpoint():
     config = ExtractorConfig(api_config={})
-    extractor = TestApiExtractor(config)
+    extractor = MockApiExtractor(config)
     
     with pytest.raises(ValueError, match="Unsupported endpoint"):
         extractor._transform_item({"id": "test"}, "invalid_endpoint")
 
 def test_watermark_filter():
     config = ExtractorConfig(api_config={})
-    extractor = TestApiExtractor(config)
+    extractor = MockApiExtractor(config)
     
     items = [
         {"id": 1, "created_at": (datetime.now() - timedelta(days=1)).isoformat()},
@@ -190,7 +190,7 @@ def test_watermark_filter():
 
 def test_watermark_filter_disabled():
     config = ExtractorConfig(api_config={})
-    extractor = TestApiExtractor(config)
+    extractor = MockApiExtractor(config)
     
     items = [
         {"id": 1, "created_at": (datetime.now() - timedelta(days=1)).isoformat()},
@@ -218,7 +218,7 @@ async def test_extract_method():
         }
     })
     
-    extractor = TestApiExtractor(config)
+    extractor = MockApiExtractor(config)
     
     # Mock aiohttp.ClientSession to avoid actual HTTP requests
     class MockResponse:

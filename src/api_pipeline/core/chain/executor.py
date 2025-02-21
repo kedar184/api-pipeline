@@ -1,6 +1,6 @@
 import asyncio
 import importlib
-from typing import Dict, List, Any, Type, Optional
+from typing import Dict, List, Any, Type, Optional, Tuple
 from datetime import datetime, UTC
 from loguru import logger
 
@@ -59,18 +59,38 @@ class ChainExecutor:
         self,
         step_config: ChainedExtractorConfig,
         input_data: Any,
-        state_manager: ChainStateManager
+        state_manager: ChainStateManager,
+        chain_config: ChainConfig
     ) -> Any:
         """Execute a single step based on its processing mode."""
         # Import and create extractor
         extractor_class = self._import_extractor_class(step_config.extractor_class)
-        extractor = extractor_class(ExtractorConfig(**step_config.extractor_config))
+        
+        # Import the config class from the same module
+        module_path, class_name = step_config.extractor_class.rsplit('.', 1)
+        module = importlib.import_module(module_path)
+        config_class = getattr(module, f"{class_name.replace('Extractor', '')}Config")
+        
+        # Get merged configuration from chain config
+        extractor_name = next(
+            name for name, config in chain_config.extractors.items()
+            if config.extractor_class == step_config.extractor_class
+        )
+        merged_config = chain_config.get_extractor_config(extractor_name)
+        
+        # Create extractor with the correct config class
+        extractor = extractor_class(config_class(**merged_config))
+        
+        logger.info(f"[Step {step_config.extractor_class}] Processing mode: {step_config.processing_mode}")
+        logger.info(f"[Step {step_config.extractor_class}] Input data: {input_data}")
+        logger.info(f"[Step {step_config.extractor_class}] Input mapping: {step_config.input_mapping}")
         
         if step_config.processing_mode == ProcessingMode.SINGLE:
             return await self._execute_single(step_config, input_data, extractor)
             
         elif step_config.processing_mode == ProcessingMode.SEQUENTIAL:
             if not isinstance(input_data, dict) or not any(isinstance(v, list) for v in input_data.values()):
+                logger.error(f"[Step {step_config.extractor_class}] Sequential mode requires list input, got: {input_data}")
                 raise ValueError("Sequential mode requires list input in one of the mapped fields")
             return await self._execute_sequential(
                 step_config, input_data, extractor
@@ -78,6 +98,7 @@ class ChainExecutor:
             
         elif step_config.processing_mode == ProcessingMode.PARALLEL:
             if not isinstance(input_data, dict) or not any(isinstance(v, list) for v in input_data.values()):
+                logger.error(f"[Step {step_config.extractor_class}] Parallel mode requires list input, got: {input_data}")
                 raise ValueError("Parallel mode requires list input in one of the mapped fields")
             return await self._execute_parallel(
                 step_config, input_data, extractor
@@ -85,21 +106,72 @@ class ChainExecutor:
         
         raise ValueError(f"Unknown processing mode: {step_config.processing_mode}")
 
+    def _find_list_field(self, data: Dict[str, Any]) -> Tuple[Optional[str], Optional[List[Any]]]:
+        """Find the first list field in input data."""
+        for field, items in data.items():
+            if isinstance(items, list):
+                return field, items
+        return None, None
+
+    def _format_results(
+        self,
+        results: List[Dict[str, Any]],
+        errors: Dict[str, Any],
+        result_mode: ResultMode
+    ) -> Dict[str, Any]:
+        """Format results based on configuration."""
+        if result_mode == ResultMode.DICT:
+            output = {
+                "results": results,
+                "errors": errors if errors else None
+            }
+        else:  # LIST mode
+            output = {
+                "results": results,
+                "errors": errors if errors else None
+            }
+        return output
+
     async def _execute_single(
         self,
         config: ChainedExtractorConfig,
         data: Any,
         extractor: BaseExtractor
-    ) -> Any:
-        """Process single item directly."""
+    ) -> List[Dict[str, Any]]:
+        """Process item(s) and always return a list of dictionaries."""
         params = self._map_input(data, config.input_mapping)
         try:
-            result = await extractor.extract(params)
-            self._metrics['items_processed'] += 1
-            return result
+            results = await extractor.extract(params)
+            # Ensure we always have a list of dictionaries
+            if not results:
+                return []
+            if not isinstance(results, list):
+                results = [results]
+            self._metrics['items_processed'] += len(results)
+            return results
         except Exception as e:
             self._metrics['errors_encountered'] += 1
             raise
+
+    async def _process_item(
+        self,
+        item: Any,
+        item_data: Dict[str, Any],
+        extractor: BaseExtractor,
+        error_mode: ErrorHandlingMode
+    ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """Process a single item with error handling."""
+        try:
+            result = await extractor.extract(item_data)
+            if not isinstance(result, list):
+                result = [result]
+            self._metrics['items_processed'] += len(result)
+            return result, None
+        except Exception as e:
+            self._metrics['errors_encountered'] += 1
+            if error_mode == ErrorHandlingMode.FAIL_FAST:
+                raise
+            return [], {"error": str(e)}
 
     async def _execute_sequential(
         self,
@@ -108,19 +180,10 @@ class ChainExecutor:
         extractor: BaseExtractor
     ) -> Dict[str, Any]:
         """Process list items sequentially with error handling."""
-        sequential_config = config.sequential_config
-        if not sequential_config:
-            sequential_config = SequentialConfig()  # Use defaults
-            
+        sequential_config = config.sequential_config or SequentialConfig()
+        
         # Find the list field in input data
-        list_field = None
-        list_items = None
-        for field, items in data.items():
-            if isinstance(items, list):
-                list_field = field
-                list_items = items
-                break
-                
+        list_field, list_items = self._find_list_field(data)
         if not list_field or not list_items:
             raise ValueError("No list field found in input data")
             
@@ -128,32 +191,30 @@ class ChainExecutor:
         errors = {}
         
         for item in list_items:
-            try:
-                # Create input data with current item
-                item_data = {**data, list_field: item}
-                result = await self._execute_single(config, item_data, extractor)
-                results.append(result)
-            except Exception as e:
-                self._metrics['errors_encountered'] += 1
-                if sequential_config.error_handling == ErrorHandlingMode.FAIL_FAST:
-                    raise
-                errors[str(item)] = {"error": str(e)}
+            # Create input data with just the current item and mapped field name
+            item_data = {}
+            for param_name, state_key in config.input_mapping.items():
+                if state_key == list_field:
+                    item_data[param_name] = item
+                else:
+                    item_data[param_name] = data.get(state_key)
+            
+            # Process item
+            item_results, error = await self._process_item(
+                item, 
+                item_data, 
+                extractor, 
+                sequential_config.error_handling
+            )
+            
+            if error:
+                errors[str(item)] = error
                 if sequential_config.error_handling == ErrorHandlingMode.CONTINUE:
                     continue
+            else:
+                results.extend(item_results)
                 
-        # Format results based on configuration
-        if sequential_config.result_handling == ResultMode.DICT:
-            output = {
-                "results": {str(item): result for item, result in zip(list_items, results)},
-                "errors": errors if errors else None
-            }
-        else:
-            output = {
-                "results": results,
-                "errors": errors if errors else None
-            }
-            
-        return output
+        return self._format_results(results, errors, sequential_config.result_handling)
 
     async def _execute_parallel(
         self,
@@ -167,14 +228,7 @@ class ChainExecutor:
             raise ValueError("Parallel configuration required for parallel mode")
             
         # Find the list field in input data
-        list_field = None
-        list_items = None
-        for field, items in data.items():
-            if isinstance(items, list):
-                list_field = field
-                list_items = items
-                break
-                
+        list_field, list_items = self._find_list_field(data)
         if not list_field or not list_items:
             raise ValueError("No list field found in input data")
             
@@ -182,16 +236,22 @@ class ChainExecutor:
         
         async def process_with_semaphore(item):
             async with semaphore:
-                try:
-                    # Create input data with current item
-                    item_data = {**data, list_field: item}
-                    result = await self._execute_single(config, item_data, extractor)
-                    return str(item), result, None
-                except Exception as e:
-                    self._metrics['errors_encountered'] += 1
-                    if parallel_config.error_handling == ErrorHandlingMode.FAIL_FAST:
-                        raise
-                    return str(item), None, str(e)
+                # Create input data with current item
+                item_data = {}
+                for param_name, state_key in config.input_mapping.items():
+                    if state_key == list_field:
+                        item_data[param_name] = item
+                    else:
+                        item_data[param_name] = data.get(state_key)
+                
+                # Process item
+                item_results, error = await self._process_item(
+                    item,
+                    item_data,
+                    extractor,
+                    parallel_config.error_handling
+                )
+                return str(item), item_results, error
         
         # Process items with optional batching
         if parallel_config.batch_size:
@@ -208,28 +268,16 @@ class ChainExecutor:
             ])
         
         # Organize results and errors
-        results = {}
+        results = []
         errors = {}
         
-        for item_key, result, error in all_results:
+        for item_key, item_results, error in all_results:
             if error:
-                errors[item_key] = {"error": error}
-            elif result is not None:
-                results[item_key] = result
+                errors[item_key] = error
+            else:
+                results.extend(item_results)
         
-        # Format output based on configuration
-        if parallel_config.result_handling == ResultMode.DICT:
-            output = {
-                "results": results,
-                "errors": errors if errors else None
-            }
-        else:
-            output = {
-                "results": list(results.values()),
-                "errors": errors if errors else None
-            }
-            
-        return output
+        return self._format_results(results, errors, parallel_config.result_handling)
 
     def _map_input(self, data: Any, mapping: Dict[str, str]) -> Dict[str, Any]:
         """Map input data to extractor parameters."""
@@ -240,8 +288,23 @@ class ChainExecutor:
                 if value is None:
                     logger.warning(f"No value found for state key: {state_key}")
                 mapped[param] = value
+            logger.info(f"Mapped input data: {mapped}")
             return mapped
         return {param: data for param, _ in mapping.items()}
+
+    def _get_nested_value(self, data: Dict[str, Any], path: str) -> Any:
+        """Get value from nested dictionary using dot notation"""
+        if path == 'self':
+            return data
+        
+        keys = path.split('.')
+        value = data
+        for key in keys:
+            if isinstance(value, dict):
+                value = value.get(key)
+            else:
+                return None
+        return value
 
     def _map_output(self, data: Any, mapping: Dict[str, str]) -> Dict[str, Any]:
         """Map extractor output to chain state.
@@ -276,103 +339,92 @@ class ChainExecutor:
         
         try:
             # Store initial parameters
+            logger.info(f"[Chain {chain_config.chain_id}] Starting chain execution")
+            logger.info(f"[Chain {chain_config.chain_id}] Initial parameters: {initial_params}")
+            
             for key, value in initial_params.items():
-                logger.info(f"Setting initial state: {key} = {value}")
+                logger.info(f"[Chain {chain_config.chain_id}] Setting initial state: {key} = {value}")
                 await state_manager.set_state(key, value)
             
             # Execute each step
-            for step_num, step_config in enumerate(chain_config.extractors, 1):
-                logger.info(f"Executing chain step {step_num}: {step_config.extractor_class}")
+            for step_num, step in enumerate(chain_config.chain, 1):
+                # Get extractor config
+                extractor_config = chain_config.extractors[step.extractor]
+                logger.info(f"[Chain {chain_config.chain_id}] Executing step {step_num}: {extractor_config.extractor_class}")
+                logger.info(f"[Chain {chain_config.chain_id}] Step {step_num} processing mode: {extractor_config.processing_mode}")
                 
-                # Get input data from state
-                input_data = {}
-                for param_name, state_key in step_config.input_mapping.items():
+                # Check condition if present
+                if step.condition:
+                    field = step.condition['field']
+                    operator = step.condition['operator']
+                    value = step.condition['value']
+                    
+                    field_value = await state_manager.get_state(field)
+                    if field_value is None:
+                        logger.warning(f"[Chain {chain_config.chain_id}] Step {step_num} condition field not found: {field}")
+                        continue
+                    
+                    # Handle empty list results
+                    if isinstance(field_value, list):
+                        if not field_value:  # Empty list
+                            logger.warning(f"[Chain {chain_config.chain_id}] Step {step_num} condition field is empty list: {field}")
+                            continue
+                        field_value = field_value[0]  # Take first value for comparison
+                    
+                    # Convert to float for numeric comparisons
+                    try:
+                        field_value = float(field_value)
+                    except (TypeError, ValueError):
+                        logger.warning(f"[Chain {chain_config.chain_id}] Step {step_num} condition field not numeric: {field}")
+                        continue
+                    
+                    if operator == 'gt' and not (field_value > value):
+                        logger.info(f"[Chain {chain_config.chain_id}] Step {step_num} condition not met: {field_value} <= {value}")
+                        continue
+                    elif operator == 'lt' and not (field_value < value):
+                        logger.info(f"[Chain {chain_config.chain_id}] Step {step_num} condition not met: {field_value} >= {value}")
+                        continue
+                    elif operator == 'eq' and not (field_value == value):
+                        logger.info(f"[Chain {chain_config.chain_id}] Step {step_num} condition not met: {field_value} != {value}")
+                        continue
+                
+                # Get input parameters from state
+                input_params = {}
+                for state_key, param_key in extractor_config.input_mapping.items():
                     value = await state_manager.get_state(state_key)
-                    logger.info(f"Got state for {state_key}: {value}")
-                    input_data[state_key] = value
+                    if value is not None:
+                        logger.info(f"[Chain {chain_config.chain_id}] Step {step_num} input mapping: {state_key} -> {param_key} = {value}")
+                        input_params[param_key] = value
                 
-                # Execute step with appropriate processing mode
+                # Execute step
                 try:
-                    results = await self.execute_step(step_config, input_data, state_manager)
-                    logger.info(f"Step {step_num} results: {results}")
+                    results = await self.execute_step(extractor_config, input_params, state_manager, chain_config)
+                    logger.info(f"[Chain {chain_config.chain_id}] Step {step_num} raw results: {results}")
+                    
+                    # Map results to state
+                    if results:
+                        for result_key, state_key in extractor_config.output_mapping.items():
+                            value = self._get_nested_value(results[0], result_key)
+                            if value is not None:
+                                logger.info(f"[Chain {chain_config.chain_id}] Step {step_num} setting state: {state_key} = {value}")
+                                await state_manager.set_state(state_key, value)
+                            else:
+                                logger.warning(f"[Chain {chain_config.chain_id}] Step {step_num} no value for result key: {result_key}")
+                    else:
+                        logger.warning(f"[Chain {chain_config.chain_id}] Step {step_num} produced no results")
+                        
                 except Exception as e:
-                    logger.error(f"Error in chain step {step_num}: {str(e)}")
-                    raise
-                
-                # Map results to state based on processing mode
-                if step_config.processing_mode == ProcessingMode.SINGLE:
-                    # For single mode, map results directly using output mapping
-                    if isinstance(results, dict):
-                        for result_key, state_key in step_config.output_mapping.items():
-                            value = results.get(result_key)
-                            if value is not None:
-                                logger.info(f"Setting state for {state_key}: {value}")
-                                await state_manager.set_state(state_key, value)
-                            else:
-                                logger.warning(f"No value found for result key: {result_key}")
-                    else:
-                        # If results is not a dict, store it directly for each output mapping
-                        for _, state_key in step_config.output_mapping.items():
-                            logger.info(f"Setting state for {state_key}: {results}")
-                            await state_manager.set_state(state_key, results)
-                else:
-                    # Handle sequential/parallel processing results
-                    if isinstance(results, dict) and "results" in results:
-                        if results.get("errors"):
-                            logger.warning(f"Step {step_num} errors: {results['errors']}")
-                            await state_manager.set_state("_errors", results["errors"])
-                        results = results["results"]
-                    
-                    # Handle list results
-                    if isinstance(results, list):
-                        # If we have a list of dictionaries, extract the mapped fields
-                        if results and isinstance(results[0], dict):
-                            mapped_results = {}
-                            for result_key, state_key in step_config.output_mapping.items():
-                                if result_key in results[0]:
-                                    mapped_results[state_key] = [r[result_key] for r in results]
-                                else:
-                                    logger.warning(f"No value found for result key: {result_key}")
-                            results = mapped_results
-                    
-                    # Store results in state
-                    if isinstance(results, dict):
-                        for result_key, state_key in step_config.output_mapping.items():
-                            value = results.get(result_key)
-                            if value is not None:
-                                logger.info(f"Setting state for {state_key}: {value}")
-                                await state_manager.set_state(state_key, value)
-                            else:
-                                logger.warning(f"No value found for result key: {result_key}")
-                    else:
-                        # If results is not a dict, store it directly for each output mapping
-                        for _, state_key in step_config.output_mapping.items():
-                            logger.info(f"Setting state for {state_key}: {results}")
-                            await state_manager.set_state(state_key, results)
+                    if extractor_config.required:
+                        raise
+                    logger.warning(f"[Chain {chain_config.chain_id}] Non-required step {step_num} failed: {str(e)}")
             
-            # Get final results
-            final_results = {}
-            for step_config in chain_config.extractors:
-                for state_key in step_config.output_mapping.values():
-                    value = await state_manager.get_state(state_key)
-                    logger.info(f"Final result for {state_key}: {value}")
-                    final_results[state_key] = value
-            
-            # Add errors if any
-            errors = await state_manager.get_state("_errors")
-            if errors:
-                final_results["_errors"] = errors
-            
-            # Update metrics
-            self._metrics['chains_executed'] += 1
-            execution_time = (datetime.now(UTC) - start_time).total_seconds()
-            self._metrics['total_execution_time'] += execution_time
-            self._metrics['last_execution_time'] = datetime.now(UTC)
-            
-            return final_results
+            # Get final state
+            final_state = await state_manager.get_all_state()
+            logger.info(f"[Chain {chain_config.chain_id}] Chain execution completed in {(datetime.now(UTC) - start_time).total_seconds():.2f}s")
+            return final_state
             
         except Exception as e:
-            self._metrics['chains_failed'] += 1
+            logger.error(f"[Chain {chain_config.chain_id}] Chain execution failed: {str(e)}")
             raise
             
         finally:

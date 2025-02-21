@@ -10,6 +10,7 @@ from api_pipeline.core.chain.models import (
     RetryConfig
 )
 from api_pipeline.core.chain.state import ChainStateManager
+from api_pipeline.core.chain.chain import ExtractorChain
 
 __all__ = [
     'ChainExecutor',
@@ -21,5 +22,6 @@ __all__ = [
     'ResultMode',
     'ParallelConfig',
     'SequentialConfig',
-    'RetryConfig'
+    'RetryConfig',
+    'ExtractorChain'
 ] 

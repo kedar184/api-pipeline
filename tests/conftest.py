@@ -4,6 +4,7 @@ from typing import Dict, List, Optional
 
 from api_pipeline.core.base import OutputConfig, ExtractorConfig
 from api_pipeline.core.models import PipelineConfig
+from api_pipeline.core.auth import AuthConfig
 
 
 @pytest.fixture
@@ -27,10 +28,12 @@ def base_extractor_config() -> ExtractorConfig:
             "test": "/test",
             "items": "/items"
         },
-        auth_type="bearer",
-        auth_credentials={
-            "token": "test-token"
-        },
+        auth_config=AuthConfig(
+            auth_type="bearer",
+            auth_credentials={
+                "token": "test-token"
+            }
+        ),
         rate_limit=10,
         retry_count=3
     )
@@ -55,8 +58,8 @@ def base_pipeline_config(base_extractor_config: ExtractorConfig) -> PipelineConf
         pipeline_id="test-pipeline",
         description="Test pipeline",
         enabled=True,
-        extractor_class="test.TestExtractor",
-        api_config=base_extractor_config.dict(),
+        extractor_class="tests.core.test_factory.MockExtractor",
+        api_config=base_extractor_config.model_dump(),
         parameters=[],
         output=[]
     )

@@ -146,14 +146,13 @@ class LinkHeaderStrategy(PaginationStrategy):
                 params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
                 
                 # Preserve essential parameters from current params
-                essential_params = ['repo', 'since', 'until']
+                essential_params = ['repo', 'since', 'until', 'per_page', 'page_size']
                 for param in essential_params:
                     if param in current_params and param not in params:
                         params[param] = current_params[param]
                 
-                # Ensure page number increments correctly
-                if 'page' in params:
-                    params['page'] = str(page_number + 1)
+                # Use the current page number + 1 to ensure proper incrementing
+                params['page'] = str(page_number + 1)
                 
                 return params
                 

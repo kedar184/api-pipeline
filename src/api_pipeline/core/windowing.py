@@ -29,7 +29,8 @@ class WindowConfig(BaseModel):
         # Convert window overlap string to seconds
         return self._parse_duration(self.window_overlap)
     
-    def _parse_duration(self, duration: str) -> int:
+    @staticmethod
+    def _parse_duration(duration: str) -> int:
         # Parse duration string (e.g., "1h", "30m") to seconds
         unit = duration[-1].lower()
         value = int(duration[:-1])

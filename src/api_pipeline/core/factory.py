@@ -14,7 +14,8 @@ class PipelineFactory:
     """Factory for creating pipeline instances."""
 
     _output_handlers: Dict[str, Type[BaseOutput]] = {}
-    _secret_manager = SecretManager()
+    _instance = None
+    _secret_manager = SecretManager(test_mode=True)
 
     @classmethod
     def register_output(cls, type_name: str, handler_class: Type[BaseOutput]) -> None:

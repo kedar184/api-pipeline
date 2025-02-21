@@ -6,6 +6,7 @@ from loguru import logger
 from datetime import datetime
 import os
 import shutil
+import aiofiles
 
 class DateTimeEncoder(json.JSONEncoder):
     """Custom JSON encoder that handles datetime objects."""
@@ -100,6 +101,33 @@ class ChainStateManager:
         except Exception as e:
             logger.error(f"Error writing state for key {key}: {str(e)}")
             raise
+    
+    async def get_all_state(self) -> Dict[str, Any]:
+        """Get all stored state values.
+
+        Returns:
+            A dictionary containing all state key-value pairs
+        """
+        try:
+            state = {}
+            for root, _, files in os.walk(self.state_dir):
+                for file in files:
+                    if file.endswith('.json'):
+                        # Get relative path from state directory
+                        rel_path = os.path.relpath(root, self.state_dir)
+                        if rel_path == '.':
+                            key = os.path.splitext(file)[0]
+                        else:
+                            key = f"{rel_path}.{os.path.splitext(file)[0]}"
+                        
+                        file_path = os.path.join(root, file)
+                        async with aiofiles.open(file_path, 'r') as f:
+                            data = await f.read()
+                            state[key] = json.loads(data)
+            return state
+        except Exception as e:
+            logger.error(f"Error getting all state: {str(e)}")
+            return {}
     
     async def cleanup(self) -> None:
         """Clean up state files."""

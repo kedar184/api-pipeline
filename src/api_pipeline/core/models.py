@@ -95,3 +95,11 @@ class PipelineStatus(BaseModel):
     last_run: str = Field(...)
     records_processed: int = Field(0)
     errors: List[str] = Field(default_factory=list)
+
+
+class PipelineRunConfig(BaseModel):
+    """Configuration for a pipeline run."""
+    parameters: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    output_config: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    watermark_config: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    parallel_config: Optional[Dict[str, Any]] = Field(default_factory=dict)

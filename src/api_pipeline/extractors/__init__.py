@@ -1,12 +1,13 @@
-"""Data extractors for pipeline sources."""
+"""API Pipeline extractors package."""
 
-from api_pipeline.extractors.weather import WeatherExtractor
-from api_pipeline.extractors.github import GitHubExtractor
-from api_pipeline.extractors.github_commits import GitHubCommitsExtractor
+from api_pipeline.extractors.openweathermap import (
+    CurrentWeatherExtractor,
+    ForecastExtractor,
+    AirQualityExtractor
+)
 
-# Export extractor classes
 __all__ = [
-    "WeatherExtractor",
-    "GitHubExtractor",
-    "GitHubCommitsExtractor"
+    'CurrentWeatherExtractor',
+    'ForecastExtractor',
+    'AirQualityExtractor'
 ] 

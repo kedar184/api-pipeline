@@ -1,0 +1,94 @@
+name: mock_openweathermap_chain
+description: Chain of mock OpenWeatherMap API extractors for testing
+
+auth:
+  auth_type: api_key
+  auth_credentials:
+    api_key: mock_api_key
+  headers_prefix: ApiKey
+
+base_config:
+  base_url: http://localhost:8000  # Mock server URL
+  monthly_call_limit: 1000
+  per_minute_limit: 30
+
+chain:
+  - extractor: current_weather
+    required: true
+    output_mapping:
+      - source: location.coordinates.lat
+        target: lat
+      - source: location.coordinates.lon
+        target: lon
+      - source: weather.temperature_celsius
+        target: current_temp_celsius
+      - source: self
+        target: current_weather
+
+  - extractor: forecast
+    required: false
+    condition:
+      field: current_temp_celsius
+      operator: gt
+      value: 25.0
+    output_mapping:
+      - source: location.coordinates.lat
+        target: lat
+      - source: location.coordinates.lon
+        target: lon
+      - source: self
+        target: forecast
+
+  - extractor: air_quality
+    required: true
+    output_mapping:
+      - source: self
+        target: air_quality
+
+extractors:
+  current_weather:
+    type: current
+    endpoints:
+      current_weather: /data/2.5/weather
+
+  forecast:
+    type: forecast
+    endpoints:
+      forecast: /data/2.5/forecast
+    config:
+      temperature_threshold: 25.0
+
+  air_quality:
+    type: air_quality
+    endpoints:
+      air_pollution: /data/2.5/air_pollution
+    config:
+      aqi_threshold: 3
+
+test_cities:
+  - name: Dubai
+    description: Hot climate - should trigger forecast
+    lat: 25.2048
+    lon: 55.2708
+    expected:
+      current_weather: true
+      forecast: true
+      air_quality: true
+    
+  - name: Reykjavik
+    description: Cold climate - shouldn't trigger forecast
+    lat: 64.1466
+    lon: -21.9426
+    expected:
+      current_weather: true
+      forecast: false
+      air_quality: true
+    
+  - name: Beijing
+    description: City with air quality concerns
+    lat: 39.9042
+    lon: 116.4074
+    expected:
+      current_weather: true
+      forecast: true
+      air_quality: true 

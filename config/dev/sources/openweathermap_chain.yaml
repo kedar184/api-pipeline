@@ -1,0 +1,126 @@
+name: openweathermap_chain
+description: Chain of OpenWeatherMap API extractors for weather and air quality data
+
+# Required chain configuration
+chain_id: openweathermap_chain_1
+state_dir: /tmp/openweathermap_chain
+
+# Base configuration for all extractors
+base_config:
+  base_url: http://localhost:8000
+  monthly_call_limit: 1000
+  per_minute_limit: 30
+  auth_config:
+    auth_type: api_key
+    auth_credentials:
+      api_key: mock_api_key
+    headers_prefix: ApiKey
+
+# Individual extractor configurations
+extractors:
+  current_weather:
+    extractor_class: api_pipeline.extractors.openweathermap.current.CurrentWeatherExtractor
+    extractor_config:
+      endpoints:
+        current_weather: /data/2.5/weather
+      units: metric
+    required: true
+    processing_mode: single
+    input_mapping:
+      lat: lat
+      lon: lon
+    output_mapping:
+      weather_location.coordinates.lat: lat
+      weather_location.coordinates.lon: lon
+      weather_data.temperature.celsius: current_temp_celsius
+      self: current_weather
+      
+  forecast:
+    extractor_class: api_pipeline.extractors.openweathermap.forecast.ForecastExtractor
+    extractor_config:
+      endpoints:
+        forecast: /data/2.5/forecast
+      units: metric
+      temperature_threshold: 25.0
+    required: false
+    processing_mode: single
+    input_mapping:
+      lat: lat
+      lon: lon
+      current_temp_celsius: current_temp_celsius
+    output_mapping:
+      weather_location.coordinates.lat: lat
+      weather_location.coordinates.lon: lon
+      self: forecast
+      
+  air_quality:
+    extractor_class: api_pipeline.extractors.openweathermap.air_quality.AirQualityExtractor
+    extractor_config:
+      endpoints:
+        air_pollution: /data/2.5/air_pollution
+      aqi_threshold: 3
+    required: true
+    processing_mode: single
+    input_mapping:
+      lat: lat
+      lon: lon
+    output_mapping:
+      self: air_quality
+
+# Chain configuration - defines the order and dependencies
+chain:
+  - extractor: current_weather
+    output_mapping:
+      - source: weather_location.coordinates.lat
+        target: lat
+      - source: weather_location.coordinates.lon
+        target: lon
+      - source: weather_data.temperature.celsius
+        target: current_temp_celsius
+      - source: self
+        target: current_weather
+
+  - extractor: forecast
+    condition:
+      field: current_temp_celsius
+      operator: gt
+      value: 25.0
+    output_mapping:
+      - source: weather_location.coordinates.lat
+        target: lat
+      - source: weather_location.coordinates.lon
+        target: lon
+      - source: self
+        target: forecast
+
+  - extractor: air_quality
+    output_mapping:
+      - source: self
+        target: air_quality
+
+# Test cities with different climate characteristics
+test_cities:
+  - name: Dubai
+    description: Hot desert climate, consistently high temperatures
+    lat: 25.2048
+    lon: 55.2708
+    
+  - name: Reykjavik
+    description: Cool maritime climate, rarely exceeds temperature threshold
+    lat: 64.1466
+    lon: -21.9426
+    
+  - name: Beijing
+    description: Continental climate with seasonal variations
+    lat: 39.9042
+    lon: 116.4074
+    
+  - name: New Delhi
+    description: Hot climate with poor air quality
+    lat: 28.6139
+    lon: 77.2090
+    
+  - name: Zurich
+    description: Moderate climate with good air quality
+    lat: 47.3769
+    lon: 8.5417 

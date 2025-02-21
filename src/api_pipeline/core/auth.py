@@ -1,16 +1,11 @@
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, UTC
-from typing import Dict, Optional, Union, ClassVar
+from typing import Dict, Optional, Union, ClassVar, Any
 import aiohttp
 from pydantic import BaseModel, Field
 from loguru import logger
 
-class AuthType:
-    """Constants for supported authentication types."""
-    OAUTH = "oauth"
-    API_KEY = "api_key"
-    BEARER = "bearer"
-    BASIC = "basic"
+from api_pipeline.core.types import AuthType
 
 class AuthConfig(BaseModel):
     """Base authentication configuration."""
@@ -133,21 +128,47 @@ class OAuthHandler(BaseAuth):
             "Authorization": f"Bearer {self.config.access_token}"
         }
 
-class ApiKeyAuth(BaseAuth):
-    """API Key authentication."""
-    
-    def __init__(self, config: AuthConfig):
-        super().__init__()
-        self.config = config
-    
-    async def get_auth_headers(self) -> Dict[str, str]:
-        """Get API key headers."""
-        self._metrics['auth_attempts'] += 1
-        self._metrics['last_auth_time'] = datetime.now(UTC)
+class ApiKeyAuth:
+    """API Key authentication handler that supports both header and query parameter auth."""
+    def __init__(self, auth_config: AuthConfig):
+        """Initialize API Key auth handler.
         
-        prefix = self.config.headers_prefix or "ApiKey"
+        Args:
+            auth_config: Authentication configuration
+        """
+        self.auth_config = auth_config
+        if 'api_key' not in auth_config.auth_credentials:
+            raise ValueError("API key not found in credentials")
+        self.api_key = auth_config.auth_credentials['api_key']
+        self.headers_prefix = auth_config.headers_prefix
+
+    async def get_auth_headers(self) -> Dict[str, str]:
+        """Get authentication headers.
+        
+        Returns:
+            Dictionary of auth headers
+        """
+        if self.headers_prefix:
+            return {'Authorization': f"{self.headers_prefix} {self.api_key}"}
+        return {}
+
+    def get_auth_params(self) -> Dict[str, str]:
+        """Get authentication query parameters.
+        
+        Returns:
+            Dictionary of auth parameters
+        """
+        return {'appid': self.api_key}
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get authentication metrics.
+        
+        Returns:
+            Dictionary of metrics
+        """
         return {
-            "Authorization": f"{prefix} {self.config.auth_credentials['api_key']}"
+            'auth_type': 'api_key',
+            'has_prefix': bool(self.headers_prefix)
         }
 
 class BearerAuth(BaseAuth):
